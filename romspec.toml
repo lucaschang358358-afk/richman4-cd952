@@ -1,0 +1,11 @@
+[rom]
+title = "Richman 4 CD952"
+short-title = "Richman4"
+category = "APPLET_GAME"
+default-locale = "en"
+copyright = "Richman 4 CD952 Homebrew (MIT)"
+version = "1.0.0"
+
+[metadata.en]
+title = "Richman 4 CD952"
+short-title = "Richman4"
