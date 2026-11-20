@@ -1,0 +1,61 @@
+name: Build Richman 4 CD-952
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-cd952:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Flatpak & Muteki SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.freedesktop.Sdk//24.08
+          curl -L -o muteki.flatpak \
+            https://github.com/Project-Muteki/org.freedesktop.Sdk.Extension.muteki/releases/download/2025082001/org.freedesktop.Sdk.Extension.muteki-x86_64-24.08-2025082001.flatpak
+          flatpak install --user -y muteki.flatpak
+
+      - name: Compile Richman 4 .exe
+        run: |
+          flatpak run --user --filesystem=host --command=bash org.freedesktop.Sdk//24.08 -c '
+            set -e
+            if [ -f /usr/lib/sdk/muteki/enable.sh ]; then
+              source /usr/lib/sdk/muteki/enable.sh
+            fi
+            export PATH="/usr/lib/sdk/muteki/bin:$PATH"
+
+            GCC_BIN=$(find /usr/lib/sdk/muteki -name "arm-none-bestaeabi-gcc" -type f | head -n 1)
+            BIN_DIR=$(dirname "$GCC_BIN")
+            export PATH="$BIN_DIR:$PATH"
+            CROSS_FILE="$PWD/arm9-cross.ini"
+            cat > "$CROSS_FILE" <<EOF
+          [binaries]
+          c = '\''$BIN_DIR/arm-none-bestaeabi-gcc'\''
+          cpp = '\''$BIN_DIR/arm-none-bestaeabi-g++'\''
+          ar = '\''$BIN_DIR/arm-none-bestaeabi-ar'\''
+          strip = '\''$BIN_DIR/arm-none-bestaeabi-strip'\''
+
+          [host_machine]
+          system = '\''besta'\''
+          cpu_family = '\''arm'\''
+          cpu = '\''arm926ej-s'\''
+          endian = '\''little'\''
+          EOF
+
+            meson setup build-muteki --buildtype=release --cross-file "$CROSS_FILE"
+            meson compile -C build-muteki
+            ls -la build-muteki/
+          '
+
+      - name: Upload CD-952 .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: richman4-cd952-exe
+          path: build-muteki/richman4-cd952.exe
