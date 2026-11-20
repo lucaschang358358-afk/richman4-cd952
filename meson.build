@@ -1,5 +1,5 @@
 project('richman4-cd952', 'c',
-  version : '3.0.0',
+  version : '4.0.0',
   default_options : ['warning_level=2'])
 
 c = meson.get_compiler('c')
@@ -12,6 +12,7 @@ game_elf = executable('richman4-cd952',
   name_suffix: 'elf',
   dependencies: mutekix_lib,
   install : false,
+  c_args: ['-O3'],
   link_args: ['-Wl,--gc-sections'])
 
 if romtool.found() and elf2bestape.found()

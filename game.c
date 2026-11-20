@@ -6,11 +6,10 @@
 #include <string.h>
 
 /* ============================================================
- * 大富翁 4 Fun — CD-952 3D 立體完全重製版 v3
- *  - 2.5D 斜 45° 等角 3D 滾動世界 + 3D 擠出立體建築 (Lv0~Lv5) + Painter 深度排序
- *  - 真 3D 軟體三軸旋轉立體骰子 (透視投影 + 法線打光 + 3D 立體點數)
- *  - 3D 立體動畫角色 (分離地面陰影 + 高拋跳躍 + 頭頂名牌 + 剩餘步數倒數氣泡)
- *  - 全程即時行動播報：每步移動、每次擲骰、每次 AI 行動皆有醒目大字橫幅 + 左下 4 條即時戰報紀錄 + AI 行動結果卡片
+ * 大富翁 4 Fun — CD-952 極速流暢 3D 版 v4
+ *  - 零除法 DDA 3D 光柵引擎 + 局部髒矩形刷新 (Dirty-Rect) + 靜態場景快取
+ *  - 徹底消除畫面震動與文字閃爍：靜止介面不重繪、死區攝影機不微震、3D 骰子與角色局部更新
+ *  - 隨時按 [ESC] 呼叫遊戲暫停選單 (繼續 / 存檔 / AI速度 / 資產 / 說明 / 主選單 / 離開)
  * ============================================================ */
 
 #define MAX_PLAYERS    4
@@ -19,7 +18,7 @@
 #define NUM_STOCKS     6
 #define STOCK_HIST_LEN 12
 #define FEED_LINES     4
-#define SAVE_MAGIC     0x524D3433u /* "RM43" */
+#define SAVE_MAGIC     0x524D3434u /* "RM44" */
 
 typedef enum {
     CARD_NONE = 0,
@@ -49,6 +48,7 @@ typedef enum {
     ST_TITLE = 0,
     ST_SETUP,
     ST_TURN_MENU,
+    ST_PAUSE_MENU,      /* ESC 遊戲暫停選單 */
     ST_FREE_MAP,
     ST_AI_THINK,
     ST_CARD_FX,
@@ -72,6 +72,16 @@ typedef enum {
     ST_MESSAGE,
     ST_GAME_OVER
 } GameState;
+
+typedef enum {
+    RM_NONE = 0,
+    RM_FULL,            /* 全螢幕重繪 */
+    RM_TITLE_DICE,      /* 僅局部更新標題旋轉 3D 骰子 */
+    RM_DICE,            /* 僅局部更新場中 3D 骰子 */
+    RM_WALK,            /* 僅局部更新移動中的 3D 角色 */
+    RM_VFX,             /* 僅局部更新飛彈與爆炸粒子 */
+    RM_COINS            /* 僅局部更新接金幣遊戲區 */
+} RenderMode;
 
 typedef struct {
     int owner;
@@ -185,20 +195,25 @@ static const char *GOD_NAMES[6] = { "無", "財神", "福神", "土地公", "窮
 static const char *COMM_NAMES[6] = { "空地", "商業中心", "大飯店", "研究所", "公園", "加油站" };
 static const char *WIN_MODE_NAMES[3] = { "經典破產制", "資產$80000勝", "30回合決勝" };
 
-/* --- 執行與動畫狀態 --- */
+/* --- 執行與渲染快取狀態 --- */
 static GameData g;
 static GameState g_state = ST_TITLE;
 static GameState g_msg_next_state = ST_TURN_MENU;
+static GameState g_paused_state = ST_TURN_MENU;
+static GameState g_sub_return_state = ST_TURN_MENU;
 
 static int g_tick_ms = 0;
-static int g_dirty = 1;
+static RenderMode g_render_mode = RM_FULL;
+static int g_cache_ready = 0;
 static int g_fast_ai = 0;
 
-/* 3D 等角攝影機 */
+/* 局部髒矩形追蹤 */
+static int g_prev_x = 0, g_prev_y = 0, g_prev_w = 0, g_prev_h = 0;
+static int g_banner_dirty = 0;
+
+/* 穩定的死區 3D 等角攝影機 (不微震!) */
 static int g_cam_x = 0;
 static int g_cam_y = 0;
-static int g_cam_tx = 0;
-static int g_cam_ty = 0;
 static int g_free_cursor = 0;
 
 /* 開局設定 */
@@ -208,51 +223,54 @@ static int g_setup_humans = 1;
 static int g_setup_p1_char = 0;
 static int g_setup_win = 0;
 
-/* 選單與系統狀態 */
+/* 選單與系統 */
 static int g_menu_sel = 0;
+static int g_pause_sel = 0;
 static int g_pending_card_idx = -1;
 static int g_pending_card_type = CARD_NONE;
 static int g_stock_sel = 0;
 static int g_shop_items[5] = { CARD_REMOTE_DICE, CARD_MOTO, CARD_LANDMINE, CARD_MISSILE, CARD_RED_STOCK };
 static int g_lottery_pick = 7;
 
-/* 3D 骰子與跳躍行走動畫 */
+/* 3D 骰子與跳躍行走 */
 static int g_dice_count = 1;
 static int g_dice_vals[3] = { 1, 1, 1 };
 static int g_dice_total = 1;
 static int g_dice_timer = 0;
-static int g_dice_total_dur = 1350;
+static int g_dice_total_dur = 1150;
 
 static int g_walk_steps_left = 0;
 static int g_walk_from = 0;
 static int g_walk_to = 0;
 static int g_walk_elapsed = 0;
-static int g_walk_dur = 320;
+static int g_walk_dur = 280;
 static int g_walk_phase = 0;
 
-/* AI 狀態機與醒目播報系統 */
+/* AI 與播報系統 */
 static int g_state_timer = 0;
 static int g_ai_did_card = 0;
 static char g_banner_text[160] = {0};
-static int g_banner_timer = 0;
+static int g_banner_active = 0;
 static char g_ai_toast[160] = {0};
 
-/* 左下角即時 4 條戰報歷史 */
-static char g_feed[FEED_LINES][140];
+/* 左下角即時戰報歷史 */
+static char g_feed[FEED_LINES][160];
 static uint32_t g_feed_col[FEED_LINES];
 static int g_feed_count = 0;
 
 static char g_msg_title[64] = {0};
-static char g_msg_l1[128] = {0};
-static char g_msg_l2[128] = {0};
-static char g_msg_l3[128] = {0};
+static char g_msg_l1[160] = {0};
+static char g_msg_l2[160] = {0};
+static char g_msg_l3[160] = {0};
 
 /* 小遊戲 1：接金幣 */
-#define MAX_FALL_ITEMS 14
+#define MAX_FALL_ITEMS 12
 typedef struct { int active, x, y, vy, type; } FallItem;
 static FallItem g_mg_items[MAX_FALL_ITEMS];
 static int g_mg_px = 400;
 static int g_mg_score = 0;
+static int g_mg_last_score = -1;
+static int g_mg_last_sec = -1;
 static int g_mg_time_ms = 0;
 static int g_mg_spawn_ms = 0;
 static int g_mg_done = 0;
@@ -270,7 +288,17 @@ static int rng_next(int mod) {
 
 static const MapDef *cur_map(void) { return map_get(g.map_id); }
 
-/* 推入即時戰報 (左下角隨時可見最新 4 條動作！) */
+static void request_full_redraw(void) {
+    g_render_mode = RM_FULL;
+    g_cache_ready = 0;
+}
+
+static void request_partial(RenderMode rm) {
+    if (g_render_mode != RM_FULL) {
+        g_render_mode = rm;
+    }
+}
+
 static void push_feed(uint32_t col, const char *text) {
     if (!text || !text[0]) return;
     for (int i = FEED_LINES - 1; i > 0; i--) {
@@ -280,13 +308,12 @@ static void push_feed(uint32_t col, const char *text) {
     snprintf(g_feed[0], sizeof(g_feed[0]), "%s", text);
     g_feed_col[0] = col;
     if (g_feed_count < FEED_LINES) g_feed_count++;
-    g_dirty = 1;
 }
 
-static void set_banner(const char *txt, int ms) {
-    snprintf(g_banner_text, sizeof(g_banner_text), "%s", txt);
-    g_banner_timer = ms;
-    g_dirty = 1;
+static void set_banner(const char *txt) {
+    snprintf(g_banner_text, sizeof(g_banner_text), "%s", txt ? txt : "");
+    g_banner_active = (g_banner_text[0] != '\0');
+    g_banner_dirty = 1;
 }
 
 /* 3D 等角座標換算 */
@@ -313,16 +340,13 @@ static void player_iso_pos(int pi, int *wx, int *wy, int *jump_h, int *facing_le
         tile_iso_center(g_walk_from, &x0, &y0);
         tile_iso_center(g_walk_to, &x1, &y1);
         *facing_left = (x1 < x0);
-
-        /* 高拋物線 3D 跳躍高度 (最高 26px，一眼就看出角色正在跳躍移動！) */
-        *jump_h = (t * (d - t) * 104) / (d * d);
+        *jump_h = (t * (d - t) * 96) / (d * d);
         *out_depth = (gx16 + gy16 + 8) / 16;
         return;
     }
 
     int ti = g.players[pi].pos;
     tile_iso_center(ti, wx, wy);
-    /* 同格多角色略微錯開站位 */
     int ox = ((pi & 1) ? 14 : -14);
     int oy = ((pi & 2) ? 6 : -6);
     *wx += ox;
@@ -332,21 +356,32 @@ static void player_iso_pos(int pi, int *wx, int *wy, int *jump_h, int *facing_le
     *out_depth = m->tiles[ti].gx + m->tiles[ti].gy;
 }
 
-static void focus_camera_on_world(int wx, int wy, int instant) {
+/* 一次到位攝影機 (無微震拖影!) */
+static void snap_camera_to_world(int wx, int wy) {
     int sw = hal_get_width();
     int sh = hal_get_height();
-    g_cam_tx = wx - sw / 2;
-    g_cam_ty = wy - (sh / 2) + 12;
-    if (instant) {
-        g_cam_x = g_cam_tx;
-        g_cam_y = g_cam_ty;
-    }
+    g_cam_x = wx - sw / 2;
+    g_cam_y = wy - (sh / 2) - 8;
+    request_full_redraw();
 }
 
-static void focus_camera_on_player(int pi, int instant) {
+static void snap_camera_to_player(int pi) {
     int wx, wy, jh, fl, dp;
     player_iso_pos(pi, &wx, &wy, &jh, &fl, &dp);
-    focus_camera_on_world(wx, wy, instant);
+    snap_camera_to_world(wx, wy);
+}
+
+/* 檢查指定世界座標是否已超出安全可視區，只有超出時才重新置中攝影機！ */
+static int ensure_visible_in_deadzone(int wx, int wy) {
+    int sw = hal_get_width();
+    int sh = hal_get_height();
+    int sx = wx - g_cam_x;
+    int sy = wy - g_cam_y;
+    if (sx < 130 || sx > sw - 175 || sy < 168 || sy > sh - 125) {
+        snap_camera_to_world(wx, wy);
+        return 1;
+    }
+    return 0;
 }
 
 /* --- 經濟與規則計算 --- */
@@ -415,7 +450,7 @@ static void show_msg(const char *title, const char *l1, const char *l2, const ch
     snprintf(g_msg_l3, sizeof(g_msg_l3), "%s", l3 ? l3 : "");
     g_msg_next_state = next_st;
     g_state = ST_MESSAGE;
-    g_dirty = 1;
+    request_full_redraw();
 }
 
 static void pay_money(int pi, int amount, int receiver_pi) {
@@ -473,7 +508,7 @@ static void pay_money(int pi, int amount, int receiver_pi) {
         player_iso_pos(receiver_pi, &rx, &ry, &jh, &fl, &dp);
         snprintf(pop, sizeof(pop), "+$%d", amount);
         gfx_spawn_popup(rx - 24, ry - 44, pop, 0x69F0AE);
-        gfx_spawn_sparkles(rx, ry, 0xFFD54F, 12);
+        gfx_spawn_sparkles(rx, ry, 0xFFD54F, 10);
     }
 }
 
@@ -526,15 +561,16 @@ static int load_game(void) {
     g = tmp;
     gfx_vfx_reset();
     g_feed_count = 0;
-    focus_camera_on_player(g.cur_player, 1);
+    snap_camera_to_player(g.cur_player);
     g_state = g.players[g.cur_player].is_ai ? ST_AI_THINK : ST_TURN_MENU;
-    g_state_timer = 700;
+    g_state_timer = 650;
     g_menu_sel = 0;
     char msg[140];
-    snprintf(msg, sizeof(msg), "讀取存檔！%s 第%d月%d日，輪到 %s",
-             cur_map()->name, g.month, g.day, g.players[g.cur_player].name);
+    snprintf(msg, sizeof(msg), "讀取存檔！%s 第%d月%d日，輪到 P%d %s",
+             cur_map()->name, g.month, g.day, g.cur_player + 1, g.players[g.cur_player].name);
     push_feed(0xFFD54F, msg);
-    set_banner(msg, 1800);
+    set_banner(msg);
+    request_full_redraw();
     return 1;
 }
 
@@ -612,15 +648,16 @@ static void start_new_game(void) {
 
     gfx_vfx_reset();
     g_feed_count = 0;
-    focus_camera_on_player(0, 1);
+    snap_camera_to_player(0);
     g_state = ST_TURN_MENU;
     g_menu_sel = 0;
 
     char msg[140];
-    snprintf(msg, sizeof(msg), "【3D %s】%d格大冒險開始！輪到 P1 %s 擲骰！",
+    snprintf(msg, sizeof(msg), "【3D %s】%d格大冒險開始！輪到 P1 %s (按ESC暫停)",
              m->name, m->tile_count, g.players[0].name);
     push_feed(0xFFD54F, msg);
-    set_banner(msg, 2200);
+    set_banner(msg);
+    request_full_redraw();
 }
 
 static void update_daily_economy(void) {
@@ -700,7 +737,7 @@ static void advance_turn(void);
 /* --- 啟動 3D 骰子翻滾 --- */
 static void begin_dice_roll(int pi) {
     Player *p = &g.players[pi];
-    focus_camera_on_player(pi, 0);
+    snap_camera_to_player(pi);
 
     if (p->stay_flag) {
         p->stay_flag = 0;
@@ -711,10 +748,10 @@ static void begin_dice_roll(int pi) {
         char b[140];
         snprintf(b, sizeof(b), "P%d %s 發動停留卡，留在 [%s]！", pi + 1, p->name, cur_map()->tiles[p->pos].name);
         push_feed(PLAYER_COLORS[pi], b);
-        set_banner(b, 1200);
+        set_banner(b);
         g_state = ST_WALK_ANIM;
         g_walk_elapsed = g_walk_dur;
-        g_dirty = 1;
+        request_full_redraw();
         return;
     }
 
@@ -744,14 +781,14 @@ static void begin_dice_roll(int pi) {
     g_dice_total = 0;
     for (int i = 0; i < g_dice_count; i++) g_dice_total += g_dice_vals[i];
 
-    g_dice_total_dur = (p->is_ai && g_fast_ai) ? 460 : 1280;
+    g_dice_total_dur = (p->is_ai && g_fast_ai) ? 450 : 1120;
     g_dice_timer = g_dice_total_dur;
 
     char b[140];
     snprintf(b, sizeof(b), "【P%d %s】正在擲 3D 立體骰子...", pi + 1, p->name);
-    set_banner(b, g_dice_total_dur + 300);
+    set_banner(b);
     g_state = ST_DICE_ANIM;
-    g_dirty = 1;
+    request_full_redraw();
 }
 
 static void start_next_walk_step(int pi) {
@@ -760,35 +797,36 @@ static void start_next_walk_step(int pi) {
     g_walk_from = p->pos;
     g_walk_to = (p->pos + p->dir + m->tile_count) % m->tile_count;
     g_walk_elapsed = 0;
-    g_walk_dur = (p->is_ai && g_fast_ai) ? 130 : 320;
+    g_walk_dur = (p->is_ai && g_fast_ai) ? 120 : 280;
     g_walk_phase++;
 
-    int wx, wy;
-    tile_iso_center(g_walk_from, &wx, &wy);
-    gfx_spawn_dust(wx, wy + 6);
+    /* 只有目標格靠近螢幕邊緣時才重設攝影機，避免畫面一直晃動！ */
+    int tx, ty;
+    tile_iso_center(g_walk_to, &tx, &ty);
+    ensure_visible_in_deadzone(tx, ty);
 
-    /* 每走一步都即時播報目的地與剩餘步數，讓玩家一眼知道角色正在哪裡動！ */
     char mb[140];
     snprintf(mb, sizeof(mb), "【P%d %s 移動中】前往「%s」 (還剩 %d 步)",
              pi + 1, p->name, m->tiles[g_walk_to].name, g_walk_steps_left);
-    set_banner(mb, 800);
-    g_dirty = 1;
+    set_banner(mb);
+
+    if (g_render_mode != RM_FULL) {
+        request_partial(RM_WALK);
+    }
 }
 
-/* AI 落點動作結束後的明確播報卡片停頓 */
 static void finish_ai_step(const char *summary) {
-    if (check_winner()) { g_state = ST_GAME_OVER; g_dirty = 1; return; }
+    if (check_winner()) { g_state = ST_GAME_OVER; request_full_redraw(); return; }
     snprintf(g_ai_toast, sizeof(g_ai_toast), "%s", summary ? summary : "");
     if (summary && summary[0]) {
         push_feed(PLAYER_COLORS[g.cur_player], summary);
-        set_banner(summary, 1500);
+        set_banner(summary);
     }
     g_state = ST_AI_PAUSE;
-    g_state_timer = g_fast_ai ? 420 : 1450;
-    g_dirty = 1;
+    g_state_timer = g_fast_ai ? 420 : 1350;
+    request_full_redraw();
 }
 
-/* --- 落點事件處理 --- */
 static void handle_landing(int pi) {
     Player *p = &g.players[pi];
     const MapDef *m = cur_map();
@@ -800,7 +838,6 @@ static void handle_landing(int pi) {
     tile_iso_center(pos, &wx, &wy);
     char msg[150];
 
-    /* 1. 銀行 */
     if (td->type == TILE_START || td->type == TILE_BANK) {
         if (is_ai) {
             if (p->loan > 0 && p->cash >= p->loan + 4000) {
@@ -816,27 +853,20 @@ static void handle_landing(int pi) {
         } else {
             snprintf(msg, sizeof(msg), "P%d %s 抵達 %s！", pi + 1, p->name, td->name);
             push_feed(PLAYER_COLORS[pi], msg);
-            g_menu_sel = 0;
-            g_state = ST_BANK_MENU;
-            g_dirty = 1;
+            g_menu_sel = 0; g_state = ST_BANK_MENU; request_full_redraw();
         }
         return;
     }
 
-    /* 2. 點券格 */
     if (td->type == TILE_COUPON) {
         int gain = 30 + (pos % 3) * 10;
         p->coupons += gain;
-        char pop[24]; snprintf(pop, sizeof(pop), "+%d PTS", gain);
-        gfx_spawn_popup(wx - 22, wy - 36, pop, 0xFFD54F);
-        gfx_spawn_sparkles(wx, wy, 0xFFD54F, 16);
         snprintf(msg, sizeof(msg), "P%d %s 抵達點券格，獲得 +%d 點券！", pi + 1, p->name, gain);
         if (is_ai) finish_ai_step(msg);
         else { push_feed(PLAYER_COLORS[pi], msg); show_msg("獲得點券", msg, "可在卡片商店購買強力卡片與載具！", "", ST_GAME_OVER); }
         return;
     }
 
-    /* 3. 卡片商店 */
     if (td->type == TILE_SHOP) {
         refresh_shop_items();
         if (is_ai) {
@@ -847,57 +877,44 @@ static void handle_landing(int pi) {
                     p->coupons -= CARD_COSTS[c];
                     add_card(pi, (CardType)c);
                     snprintf(msg, sizeof(msg), "P%d %s 在卡片商店購入 [%s]！", pi + 1, p->name, CARD_NAMES[c]);
-                    gfx_spawn_sparkles(wx, wy, 0x69F0AE, 12);
-                    bought = 1;
-                    break;
+                    bought = 1; break;
                 }
             }
             if (!bought) snprintf(msg, sizeof(msg), "P%d %s 逛了卡片商店沒買東西。", pi + 1, p->name);
             finish_ai_step(msg);
         } else {
-            g_menu_sel = 0;
-            g_state = ST_CARD_SHOP;
-            g_dirty = 1;
+            g_menu_sel = 0; g_state = ST_CARD_SHOP; request_full_redraw();
         }
         return;
     }
 
-    /* 4. 樂透 */
     if (td->type == TILE_LOTTERY) {
         if (is_ai) {
             if (p->cash >= 3000 && p->lottery_num == 0) {
-                p->cash -= 500;
-                p->lottery_num = 1 + rng_next(20);
+                p->cash -= 500; p->lottery_num = 1 + rng_next(20);
                 snprintf(msg, sizeof(msg), "P%d %s 買了一張 %d 號樂透彩券！", pi + 1, p->name, p->lottery_num);
             } else {
                 snprintf(msg, sizeof(msg), "P%d %s 路過樂透彩券行。", pi + 1, p->name);
             }
             finish_ai_step(msg);
         } else {
-            g_lottery_pick = 1 + rng_next(20);
-            g_state = ST_LOTTERY;
-            g_dirty = 1;
+            g_lottery_pick = 1 + rng_next(20); g_state = ST_LOTTERY; request_full_redraw();
         }
         return;
     }
 
-    /* 5. 遊樂場 */
     if (td->type == TILE_MINIGAME) {
         if (is_ai) {
             int gain = 15 + rng_next(35);
             p->coupons += gain;
             snprintf(msg, sizeof(msg), "P%d %s 在遊樂場贏得 +%d 點券！", pi + 1, p->name, gain);
-            gfx_spawn_sparkles(wx, wy, 0xFFEA00, 14);
             finish_ai_step(msg);
         } else {
-            g_menu_sel = 0;
-            g_state = ST_MINIGAME_SELECT;
-            g_dirty = 1;
+            g_menu_sel = 0; g_state = ST_MINIGAME_SELECT; request_full_redraw();
         }
         return;
     }
 
-    /* 6. 魔法屋 */
     if (td->type == TILE_MAGIC) {
         if (is_ai) {
             int richest = pi;
@@ -913,14 +930,11 @@ static void handle_landing(int pi) {
             }
             finish_ai_step(msg);
         } else {
-            g_menu_sel = 0;
-            g_state = ST_MAGIC_HOUSE;
-            g_dirty = 1;
+            g_menu_sel = 0; g_state = ST_MAGIC_HOUSE; request_full_redraw();
         }
         return;
     }
 
-    /* 7. 醫院 / 監獄路過 */
     if (td->type == TILE_HOSPITAL || td->type == TILE_PRISON) {
         snprintf(msg, sizeof(msg), "P%d %s 路過 %s 參觀探望。", pi + 1, p->name, td->name);
         if (is_ai) finish_ai_step(msg);
@@ -928,25 +942,15 @@ static void handle_landing(int pi) {
         return;
     }
 
-    /* 8. 大新聞 */
     if (td->type == TILE_NEWS) {
         int ev = rng_next(8);
         char l1[128] = {0}, l2[128] = {0};
         switch (ev) {
-            case 0:
-                p->cash += 2800;
-                gfx_spawn_popup(wx - 22, wy - 36, "+$2800", 0x69F0AE);
-                gfx_spawn_sparkles(wx, wy, 0xFFD54F, 18);
-                snprintf(l1, sizeof(l1), "【新聞】P%d %s 中發票特獎 +$2800！", pi + 1, p->name);
-                break;
-            case 1:
-                pay_money(pi, 1800, -1);
-                snprintf(l1, sizeof(l1), "【新聞】徵收豪宅稅，P%d %s 繳稅 $1800！", pi + 1, p->name);
-                break;
+            case 0: p->cash += 2800; snprintf(l1, sizeof(l1), "【新聞】P%d %s 中發票特獎 +$2800！", pi + 1, p->name); break;
+            case 1: pay_money(pi, 1800, -1); snprintf(l1, sizeof(l1), "【新聞】徵收豪宅稅，P%d %s 繳稅 $1800！", pi + 1, p->name); break;
             case 2: {
                 GodType ng = (GodType)(1 + rng_next(5));
                 p->god = ng; p->god_turns = 4;
-                gfx_spawn_sparkles(wx, wy, 0xFFF176, 16);
                 snprintf(l1, sizeof(l1), "【神明降臨】%s 附身在 P%d %s 身上(4回合)！", GOD_NAMES[ng], pi + 1, p->name);
                 break;
             }
@@ -959,20 +963,17 @@ static void handle_landing(int pi) {
             case 4: {
                 CardType nc = (CardType)(1 + rng_next(CARD_COUNT - 1));
                 add_card(pi, nc);
-                gfx_spawn_sparkles(wx, wy, 0x4FC3F7, 14);
                 snprintf(l1, sizeof(l1), "【好康】P%d %s 撿到寶箱，獲得 [%s]！", pi + 1, p->name, CARD_NAMES[nc]);
                 break;
             }
             case 5:
                 p->pos = m->prison_tile; p->skip_turns = 2; p->skip_reason = 2;
-                focus_camera_on_player(pi, 0);
+                snap_camera_to_player(pi);
                 snprintf(l1, sizeof(l1), "【社會】P%d %s 違規遭移送監獄 2 回合！", pi + 1, p->name);
                 break;
             case 6: {
                 int best = -1;
-                for (int i = 0; i < m->tile_count; i++) {
-                    if (g.tiles[i].owner == pi && g.tiles[i].level < 5) { best = i; break; }
-                }
+                for (int i = 0; i < m->tile_count; i++) if (g.tiles[i].owner == pi && g.tiles[i].level < 5) { best = i; break; }
                 if (best >= 0) {
                     g.tiles[best].level++;
                     snprintf(l1, sizeof(l1), "【都更】P%d %s 的 [%s] 免費升級至 Lv.%d！", pi + 1, p->name, m->tiles[best].name, g.tiles[best].level);
@@ -992,13 +993,10 @@ static void handle_landing(int pi) {
         return;
     }
 
-    /* 9. 地產 / 商業地 */
     if (td->type == TILE_LAND || td->type == TILE_COMMERCIAL) {
         if (ts->owner >= 0 && ts->owner != pi && p->god == GOD_LAND) {
             int old_ow = ts->owner;
             ts->owner = pi;
-            gfx_spawn_sparkles(wx, wy, 0x69F0AE, 20);
-            gfx_spawn_popup(wx - 22, wy - 36, "TAKEN!", 0x69F0AE);
             snprintf(msg, sizeof(msg), "土地公顯靈！P%d %s 免費強佔 %s 的 [%s]！", pi + 1, p->name, g.players[old_ow].name, td->name);
             if (is_ai) finish_ai_step(msg);
             else { push_feed(0x69F0AE, msg); show_msg("土地公附身", msg, "", "", ST_GAME_OVER); }
@@ -1009,27 +1007,20 @@ static void handle_landing(int pi) {
             int cost = (p->god == GOD_FORTUNE) ? 0 : td->base_price;
             if (is_ai) {
                 if (p->cash >= cost + 1800 || cost == 0) {
-                    p->cash -= cost;
-                    ts->owner = pi;
-                    ts->level = 0;
+                    p->cash -= cost; ts->owner = pi; ts->level = 0;
                     if (td->type == TILE_COMMERCIAL) {
                         ts->comm = (CommType)(1 + rng_next(5));
                         snprintf(msg, sizeof(msg), "P%d %s 買下 [%s] 並蓋了 3D %s！", pi + 1, p->name, td->name, COMM_NAMES[ts->comm]);
                     } else {
                         snprintf(msg, sizeof(msg), "P%d %s 花費 $%d 買下 [%s]！", pi + 1, p->name, cost, td->name);
                     }
-                    gfx_spawn_sparkles(wx, wy, PLAYER_COLORS[pi], 18);
-                    gfx_spawn_popup(wx - 18, wy - 36, "BUY!", 0xFFD54F);
                 } else {
                     snprintf(msg, sizeof(msg), "P%d %s 走到 [%s]，暫時放棄購買。", pi + 1, p->name, td->name);
                 }
                 finish_ai_step(msg);
             } else {
-                if (p->cash >= cost) {
-                    g_menu_sel = 0;
-                    g_state = ST_BUY_LAND;
-                    g_dirty = 1;
-                } else {
+                if (p->cash >= cost) { g_menu_sel = 0; g_state = ST_BUY_LAND; request_full_redraw(); }
+                else {
                     snprintf(msg, sizeof(msg), "[%s] 售價 $%d，現金不足。", td->name, cost);
                     push_feed(0xB0BEC5, msg);
                     show_msg("現金不足", msg, "可到股市賣股或到銀行貸款。", "", ST_GAME_OVER);
@@ -1043,17 +1034,14 @@ static void handle_landing(int pi) {
                 int up_cost = (p->god == GOD_FORTUNE) ? 0 : (td->base_price / 2);
                 if (is_ai) {
                     if (p->cash >= up_cost + 1200 || up_cost == 0) {
-                        p->cash -= up_cost;
-                        ts->level++;
-                        gfx_spawn_sparkles(wx, wy, 0xFFEA00, 20);
-                        gfx_spawn_popup(wx - 22, wy - 36, "LV UP!", 0xFFEA00);
+                        p->cash -= up_cost; ts->level++;
                         snprintf(msg, sizeof(msg), "P%d %s 將 [%s] 升級成 Lv.%d 3D大樓！", pi + 1, p->name, td->name, ts->level);
                     } else {
                         snprintf(msg, sizeof(msg), "P%d %s 回到自己的 [%s]。", pi + 1, p->name, td->name);
                     }
                     finish_ai_step(msg);
                 } else {
-                    if (p->cash >= up_cost) { g_menu_sel = 0; g_state = ST_BUY_LAND; g_dirty = 1; }
+                    if (p->cash >= up_cost) { g_menu_sel = 0; g_state = ST_BUY_LAND; request_full_redraw(); }
                     else {
                         snprintf(msg, sizeof(msg), "回到自己的 [%s] (現金不足升級)。", td->name);
                         push_feed(PLAYER_COLORS[pi], msg);
@@ -1068,11 +1056,9 @@ static void handle_landing(int pi) {
             return;
         }
 
-        /* 對手的地 */
         int ow = ts->owner;
         if (td->type == TILE_COMMERCIAL && ts->comm == COMM_PARK) {
             p->coupons += 20;
-            gfx_spawn_popup(wx - 20, wy - 36, "+20 PTS", 0x69F0AE);
             snprintf(msg, sizeof(msg), "P%d %s 逛了 %s 的公園，免費拿 20 點券！", pi + 1, p->name, g.players[ow].name);
             if (is_ai) finish_ai_step(msg);
             else { push_feed(0x69F0AE, msg); show_msg("漫步公園", msg, "", "", ST_GAME_OVER); }
@@ -1080,8 +1066,6 @@ static void handle_landing(int pi) {
         }
 
         if (p->god == GOD_WEALTH) {
-            gfx_spawn_popup(wx - 20, wy - 36, "FREE!", 0xFFEA00);
-            gfx_spawn_sparkles(wx, wy, 0xFFEA00, 16);
             snprintf(msg, sizeof(msg), "財神顯靈！P%d %s 免付 %s 過路費！", pi + 1, p->name, g.players[ow].name);
             if (is_ai) finish_ai_step(msg);
             else { push_feed(0xFFEA00, msg); show_msg("財神保佑", msg, "", "", ST_GAME_OVER); }
@@ -1107,17 +1091,18 @@ static void handle_landing(int pi) {
             snprintf(l2, sizeof(l2), "(窮神附身導致過路費加倍！)");
         }
 
-        if (check_winner()) { push_feed(0xFF5252, msg); g_state = ST_GAME_OVER; g_dirty = 1; return; }
+        if (check_winner()) { push_feed(0xFF5252, msg); g_state = ST_GAME_OVER; request_full_redraw(); return; }
         if (is_ai) finish_ai_step(msg);
         else { push_feed(0xFF5252, msg); show_msg("支付過路費", msg, l2, "", ST_GAME_OVER); }
         return;
     }
 
+    (void)wx; (void)wy;
     if (is_ai) finish_ai_step("回合結束。");
     else advance_turn();
 }
 
-/* --- 卡片施放 (含 3D 飛彈/爆炸/冰凍特效與即時戰報) --- */
+/* --- 卡片施放 --- */
 static void execute_card(int pi, int card_idx, int target) {
     Player *p = &g.players[pi];
     const MapDef *m = cur_map();
@@ -1133,36 +1118,28 @@ static void execute_card(int pi, int card_idx, int target) {
     switch (ct) {
         case CARD_REMOTE_DICE:
             p->remote_dice = (target >= 1 && target <= 6) ? target : 1;
-            gfx_spawn_sparkles(px, py, 0x4FC3F7, 14);
             snprintf(l1, sizeof(l1), "P%d %s 使用遙控骰子，鎖定 %d 步！", pi + 1, p->name, p->remote_dice);
             break;
         case CARD_MOTO:
             p->vehicle = 1; p->vehicle_turns = 3;
-            gfx_spawn_sparkles(px, py, 0xFF9100, 14);
             snprintf(l1, sizeof(l1), "P%d %s 騎上 3D 重機！3回合擲2顆骰子！", pi + 1, p->name);
             break;
         case CARD_CAR:
             p->vehicle = 2; p->vehicle_turns = 3;
-            gfx_spawn_sparkles(px, py, 0xFF1744, 18);
             snprintf(l1, sizeof(l1), "P%d %s 開上 3D 跑車！3回合擲3顆骰子！", pi + 1, p->name);
             break;
         case CARD_TURTLE:
             if (target >= 0 && target < MAX_PLAYERS && !g.players[target].bankrupt) {
                 g.players[target].turtle_turns = 3;
-                int tx, ty; player_iso_pos(target, &tx, &ty, &jh, &fl, &dp);
-                focus_camera_on_world(tx, ty, 0);
-                gfx_spawn_popup(tx - 24, ty - 38, "SLOW!", 0x8BC34A);
                 snprintf(l1, sizeof(l1), "P%d %s 對 %s 使用烏龜卡(3回合走1步)！", pi + 1, p->name, g.players[target].name);
             }
             break;
         case CARD_ROADBLOCK:
             g.tiles[p->pos].has_roadblock = 1;
-            gfx_spawn_dust(px, py);
             snprintf(l1, sizeof(l1), "P%d %s 在 [%s] 放了 3D 路障！", pi + 1, p->name, m->tiles[p->pos].name);
             break;
         case CARD_LANDMINE:
             g.tiles[p->pos].has_mine = 1;
-            gfx_spawn_sparkles(px, py, 0xFF5252, 10);
             snprintf(l1, sizeof(l1), "P%d %s 在 [%s] 埋下定時地雷！", pi + 1, p->name, m->tiles[p->pos].name);
             break;
         case CARD_STAY:
@@ -1180,7 +1157,6 @@ static void execute_card(int pi, int card_idx, int target) {
             for (int i = 0; i < MAX_PLAYERS; i++) if (!g.players[i].bankrupt) { sum += g.players[i].cash; cnt++; }
             int each = (cnt > 0) ? (sum / cnt) : 0;
             for (int i = 0; i < MAX_PLAYERS; i++) if (!g.players[i].bankrupt) g.players[i].cash = each;
-            gfx_spawn_sparkles(px, py, 0xFFEA00, 26);
             snprintf(l1, sizeof(l1), "P%d %s 發動【均富卡】！每人現金變 $%d！", pi + 1, p->name, each);
             break;
         }
@@ -1191,9 +1167,7 @@ static void execute_card(int pi, int card_idx, int target) {
                 remove_card_at(target, ridx);
                 add_card(pi, stolen);
                 snprintf(l1, sizeof(l1), "P%d %s 搶走 %s 的 [%s]！", pi + 1, p->name, g.players[target].name, CARD_NAMES[stolen]);
-            } else {
-                snprintf(l1, sizeof(l1), "對手沒卡片，搶奪卡落空！");
-            }
+            } else snprintf(l1, sizeof(l1), "對手沒卡片，搶奪卡落空！");
             break;
         case CARD_BUY_LAND: {
             TileState *ts = &g.tiles[p->pos];
@@ -1203,7 +1177,6 @@ static void execute_card(int pi, int card_idx, int target) {
                 if (p->cash >= cost) {
                     int old_ow = ts->owner;
                     p->cash -= cost; g.players[old_ow].cash += cost; ts->owner = pi;
-                    gfx_spawn_sparkles(px, py, PLAYER_COLORS[pi], 20);
                     snprintf(l1, sizeof(l1), "P%d %s 強購 %s 的 [%s]！", pi + 1, p->name, g.players[old_ow].name, td->name);
                 } else snprintf(l1, sizeof(l1), "現金不足 $%d，購地卡無效！", cost);
             } else snprintf(l1, sizeof(l1), "腳下不是對手土地，購地卡落空！");
@@ -1219,8 +1192,9 @@ static void execute_card(int pi, int card_idx, int target) {
             if (best >= 0) {
                 g.tiles[best].level = 0;
                 int bx, by; tile_iso_center(best, &bx, &by);
-                focus_camera_on_world(bx, by, 0);
+                snap_camera_to_world(bx, by);
                 gfx_spawn_explosion(bx, by);
+                launch_vfx_wait = 1;
                 snprintf(l1, sizeof(l1), "大怪獸！%s 的 [%s] 被夷為平地！", g.players[target].name, m->tiles[best].name);
             } else snprintf(l1, sizeof(l1), "%s 沒有可摧毀的建築！", g.players[target].name);
             break;
@@ -1233,7 +1207,6 @@ static void execute_card(int pi, int card_idx, int target) {
             }
             if (my_t >= 0 && en_t >= 0) {
                 g.tiles[my_t].owner = target; g.tiles[en_t].owner = pi;
-                gfx_spawn_sparkles(px, py, 0xCE93D8, 20);
                 snprintf(l1, sizeof(l1), "換屋！用 [%s] 換到 %s 的 [%s]！", m->tiles[my_t].name, g.players[target].name, m->tiles[en_t].name);
             } else snprintf(l1, sizeof(l1), "雙方需各有地產才能換屋！");
             break;
@@ -1242,10 +1215,9 @@ static void execute_card(int pi, int card_idx, int target) {
             for (int i = 0; i < MAX_PLAYERS; i++) {
                 if (i != pi && !g.players[i].bankrupt) {
                     g.players[i].skip_turns = 2; g.players[i].skip_reason = 3;
-                    int tx, ty; player_iso_pos(i, &tx, &ty, &jh, &fl, &dp);
-                    gfx_spawn_ice(tx, ty);
                 }
             }
+            gfx_spawn_ice(px, py);
             snprintf(l1, sizeof(l1), "P%d %s 發動冬眠卡！所有對手冰凍 2 回合！", pi + 1, p->name);
             break;
         case CARD_TAX:
@@ -1270,8 +1242,8 @@ static void execute_card(int pi, int card_idx, int target) {
         case CARD_MISSILE:
             if (target >= 0 && target < MAX_PLAYERS && !g.players[target].bankrupt) {
                 int tx, ty; player_iso_pos(target, &tx, &ty, &jh, &fl, &dp);
+                snap_camera_to_world((px + tx) / 2, (py + ty) / 2);
                 gfx_launch_missile(px, py - 18, tx, ty - 12);
-                focus_camera_on_world(tx, ty, 0);
                 g.players[target].pos = m->hospital_tile;
                 g.players[target].skip_turns = 3;
                 g.players[target].skip_reason = 1;
@@ -1281,33 +1253,32 @@ static void execute_card(int pi, int card_idx, int target) {
             break;
         case CARD_BANISH_GOD:
             p->god = GOD_NONE; p->god_turns = 0;
-            gfx_spawn_sparkles(px, py, 0xFFFFFF, 16);
             snprintf(l1, sizeof(l1), "P%d %s 使用送神卡送走神明！", pi + 1, p->name);
             break;
         default: break;
     }
 
     push_feed(PLAYER_COLORS[pi], l1);
-    set_banner(l1, 1500);
+    set_banner(l1);
 
     if (launch_vfx_wait) {
         g_state = ST_CARD_FX;
-        g_state_timer = 1200;
-        g_dirty = 1;
+        g_state_timer = 950;
+        g_prev_w = 0;
+        request_full_redraw();
         return;
     }
     if (p->is_ai) {
         g_state = ST_CARD_FX;
-        g_state_timer = g_fast_ai ? 360 : 950;
-        g_dirty = 1;
+        g_state_timer = g_fast_ai ? 320 : 800;
+        request_full_redraw();
     } else {
         show_msg("卡片發動", l1, l2, "", ST_TURN_MENU);
     }
 }
 
-/* --- 切換下一位玩家 --- */
 static void advance_turn(void) {
-    if (check_winner()) { g_state = ST_GAME_OVER; g_dirty = 1; return; }
+    if (check_winner()) { g_state = ST_GAME_OVER; request_full_redraw(); return; }
 
     for (int tries = 0; tries < MAX_PLAYERS * 2; tries++) {
         int prev = g.cur_player;
@@ -1323,14 +1294,14 @@ static void advance_turn(void) {
         if (p->god == GOD_BADLUCK) {
             int drop = 500 + rng_next(500);
             pay_money(g.cur_player, drop, -1);
-            if (check_winner()) { g_state = ST_GAME_OVER; g_dirty = 1; return; }
+            if (check_winner()) { g_state = ST_GAME_OVER; request_full_redraw(); return; }
         }
         if (p->god != GOD_NONE) {
             p->god_turns--;
             if (p->god_turns <= 0) p->god = GOD_NONE;
         }
 
-        focus_camera_on_player(g.cur_player, 0);
+        snap_camera_to_player(g.cur_player);
 
         if (p->skip_turns > 0) {
             p->skip_turns--;
@@ -1349,20 +1320,20 @@ static void advance_turn(void) {
         if (p->is_ai) {
             g_ai_did_card = 0;
             char b[140];
-            snprintf(b, sizeof(b), "【輪到 P%d %s [AI]】正在準備行動... (空白鍵切換加速)", g.cur_player + 1, p->name);
-            set_banner(b, 1600);
+            snprintf(b, sizeof(b), "【輪到 P%d %s [AI]】準備行動... (空白加速 / ESC暫停)", g.cur_player + 1, p->name);
+            set_banner(b);
             g_state = ST_AI_THINK;
-            g_state_timer = g_fast_ai ? 240 : 680;
-            g_dirty = 1;
+            g_state_timer = g_fast_ai ? 220 : 620;
+            request_full_redraw();
             return;
         } else {
             char b[140];
-            snprintf(b, sizeof(b), "【輪到你了！P%d %s】按 Enter 擲 3D 骰子！", g.cur_player + 1, p->name);
+            snprintf(b, sizeof(b), "【輪到你了！P%d %s】按 Enter 擲骰 (按 ESC 暫停選單)", g.cur_player + 1, p->name);
             push_feed(PLAYER_COLORS[g.cur_player], b);
-            set_banner(b, 2000);
+            set_banner(b);
             g_state = ST_TURN_MENU;
             g_menu_sel = 0;
-            g_dirty = 1;
+            request_full_redraw();
             return;
         }
     }
@@ -1372,43 +1343,41 @@ static void start_coin_minigame(void) {
     memset(g_mg_items, 0, sizeof(g_mg_items));
     g_mg_px = hal_get_width() / 2;
     g_mg_score = 0;
+    g_mg_last_score = -1;
+    g_mg_last_sec = -1;
     g_mg_time_ms = 14000;
     g_mg_spawn_ms = 0;
     g_mg_done = 0;
     g_state = ST_MG_COINS;
-    g_dirty = 1;
+    request_full_redraw();
+}
+
+static void open_pause_menu(void) {
+    g_paused_state = g_state;
+    g_pause_sel = 0;
+    g_state = ST_PAUSE_MENU;
+    request_full_redraw();
 }
 
 /* ============================================================
- * 每幀動畫與物理推進
+ * 每幀推進 (僅在真正動畫進行時局部刷新，靜止時完全零重繪零閃爍!)
  * ============================================================ */
 void game_tick(int dt_ms) {
     g_tick_ms += dt_ms;
 
-    /* 標題畫面讓中央真 3D 骰子持續旋轉 */
+    /* 暫停選單開啟時完全凍結所有動畫與計時器！ */
+    if (g_state == ST_PAUSE_MENU) return;
+
+    /* 標題畫面：只局部旋轉中間 96x108 的 3D 骰子，零閃爍零負擔！ */
     if (g_state == ST_TITLE) {
-        if ((g_tick_ms / 60) != ((g_tick_ms - dt_ms) / 60)) g_dirty = 1;
+        if (g_cache_ready && ((g_tick_ms / 75) != ((g_tick_ms - dt_ms) / 75))) {
+            request_partial(RM_TITLE_DICE);
+        }
         return;
     }
 
-    /* 1. 攝影機平滑滑動跟隨 */
-    int dx = g_cam_tx - g_cam_x;
-    int dy = g_cam_ty - g_cam_y;
-    if (dx != 0 || dy != 0) {
-        g_cam_x += (abs(dx) <= 6) ? dx : (dx / 3);
-        g_cam_y += (abs(dy) <= 6) ? dy : (dy / 3);
-        g_dirty = 1;
-    }
-
-    if (gfx_vfx_is_active()) { gfx_vfx_tick(dt_ms); g_dirty = 1; }
-    if (g_banner_timer > 0) {
-        g_banner_timer -= dt_ms;
-        if (g_banner_timer <= 0) { g_banner_timer = 0; g_dirty = 1; }
-    }
-
-    /* 2. AI 思考階段 */
+    /* AI 思考階段：靜態等待，絕不無意義重繪整張畫面！ */
     if (g_state == ST_AI_THINK) {
-        g_dirty = 1;
         g_state_timer -= dt_ms;
         if (g_state_timer <= 0) {
             Player *p = &g.players[g.cur_player];
@@ -1446,63 +1415,62 @@ void game_tick(int dt_ms) {
         return;
     }
 
-    /* 3. 卡片特效等待 */
+    /* 卡片與飛彈特效：局部更新 VFX 區域 */
     if (g_state == ST_CARD_FX) {
-        g_dirty = 1;
+        if (gfx_vfx_is_active()) {
+            gfx_vfx_tick(dt_ms);
+            request_partial(RM_VFX);
+        }
         g_state_timer -= dt_ms;
         if (g_state_timer <= 0 && !gfx_missile_active()) {
-            focus_camera_on_player(g.cur_player, 0);
+            snap_camera_to_player(g.cur_player);
             if (g.players[g.cur_player].is_ai) begin_dice_roll(g.cur_player);
-            else g_state = ST_TURN_MENU;
+            else { g_state = ST_TURN_MENU; request_full_redraw(); }
         }
         return;
     }
 
-    /* 4. 3D 骰子翻滾與落地播報 */
+    /* 3D 骰子翻滾：只局部更新中間骰子框！超流暢不閃爍！ */
     if (g_state == ST_DICE_ANIM) {
-        g_dirty = 1;
         int prev_t = g_dice_timer;
         g_dice_timer -= dt_ms;
-        int reveal_ms = (g.players[g.cur_player].is_ai && g_fast_ai) ? 160 : 480;
+        int reveal_ms = (g.players[g.cur_player].is_ai && g_fast_ai) ? 150 : 420;
 
-        /* 剛落地那一刻：播報明確點數 + 爆出金星火花！ */
         if (prev_t > reveal_ms && g_dice_timer <= reveal_ms) {
             Player *p = &g.players[g.cur_player];
             char db[140];
             snprintf(db, sizeof(db), "【P%d %s】擲出 %d 點！準備前進！", g.cur_player + 1, p->name, g_dice_total);
             push_feed(PLAYER_COLORS[g.cur_player], db);
-            set_banner(db, 1000);
+            set_banner(db);
         }
 
         if (g_dice_timer <= 0) {
             g_walk_steps_left = g_dice_total;
             g_state = ST_WALK_ANIM;
-            if (g_walk_steps_left > 0) start_next_walk_step(g.cur_player);
-            else handle_landing(g.cur_player);
+            if (g_walk_steps_left > 0) {
+                start_next_walk_step(g.cur_player);
+                request_full_redraw(); /* 進入行走先建立不含移動角色的背景快取 */
+            } else {
+                handle_landing(g.cur_player);
+            }
+        } else {
+            request_partial(RM_DICE);
         }
         return;
     }
 
-    /* 5. 角色 3D 逐格跳躍行走 */
+    /* 3D 角色逐格跳躍：只局部更新角色移動的髒矩形！ */
     if (g_state == ST_WALK_ANIM) {
-        g_dirty = 1;
         Player *p = &g.players[g.cur_player];
         const MapDef *m = cur_map();
-
         g_walk_elapsed += dt_ms;
-        focus_camera_on_player(g.cur_player, 0);
 
         if (g_walk_elapsed >= g_walk_dur) {
             p->pos = g_walk_to;
             g_walk_steps_left--;
 
-            int wx, wy;
-            tile_iso_center(p->pos, &wx, &wy);
-
             if (p->pos == 0) {
                 p->cash += 2000;
-                gfx_spawn_popup(wx - 22, wy - 36, "+$2000", 0xFFEA00);
-                gfx_spawn_sparkles(wx, wy, 0xFFEA00, 14);
                 char pb[128];
                 snprintf(pb, sizeof(pb), "P%d %s 經過起點，領取薪水 +$2000！", g.cur_player + 1, p->name);
                 push_feed(0xFFEA00, pb);
@@ -1515,17 +1483,15 @@ void game_tick(int dt_ms) {
                 char gb[128];
                 snprintf(gb, sizeof(gb), "P%d %s 巧遇【%s】附身 5 回合！", g.cur_player + 1, p->name, GOD_NAMES[p->god]);
                 push_feed(0xFFF176, gb);
-                set_banner(gb, 1200);
-                gfx_spawn_sparkles(wx, wy, 0xFFF176, 16);
+                set_banner(gb);
+                request_full_redraw();
             }
 
             if (g.tiles[p->pos].has_mine) {
                 g.tiles[p->pos].has_mine = 0;
                 g_walk_steps_left = 0;
-                gfx_spawn_explosion(wx, wy);
-                gfx_spawn_popup(wx - 24, wy - 38, "BOOM!", 0xFF1744);
                 p->pos = m->hospital_tile; p->skip_turns = 2; p->skip_reason = 1;
-                focus_camera_on_player(g.cur_player, 0);
+                snap_camera_to_player(g.cur_player);
                 char mb[140];
                 snprintf(mb, sizeof(mb), "轟隆！P%d %s 踩中地雷炸進醫院 2 回合！", g.cur_player + 1, p->name);
                 if (p->is_ai) finish_ai_step(mb);
@@ -1536,11 +1502,10 @@ void game_tick(int dt_ms) {
             if (g.tiles[p->pos].has_roadblock) {
                 g.tiles[p->pos].has_roadblock = 0;
                 g_walk_steps_left = 0;
-                gfx_spawn_popup(wx - 22, wy - 38, "STOP!", 0xFF6D00);
                 char rb[140];
                 snprintf(rb, sizeof(rb), "P%d %s 撞到 3D 路障，停在 [%s]！", g.cur_player + 1, p->name, m->tiles[p->pos].name);
                 push_feed(0xFF9100, rb);
-                set_banner(rb, 1100);
+                set_banner(rb);
                 handle_landing(g.cur_player);
                 return;
             }
@@ -1550,68 +1515,71 @@ void game_tick(int dt_ms) {
             } else {
                 handle_landing(g.cur_player);
             }
+        } else {
+            request_partial(RM_WALK);
         }
         return;
     }
 
-    /* 6. AI 行動結果展示停頓 */
+    /* AI 報告停頓：完全靜止不重繪不閃爍！ */
     if (g_state == ST_AI_PAUSE) {
-        g_dirty = 1;
         g_state_timer -= dt_ms;
         if (g_state_timer <= 0) advance_turn();
         return;
     }
 
-    /* 7. 即時小遊戲：接金幣 */
+    /* 即時接金幣小遊戲：只局部刷新遊玩區 */
     if (g_state == ST_MG_COINS && !g_mg_done) {
-        g_dirty = 1;
         int sw = hal_get_width(), sh = hal_get_height();
         g_mg_time_ms -= dt_ms;
         g_mg_spawn_ms -= dt_ms;
         if (g_mg_spawn_ms <= 0) {
-            g_mg_spawn_ms = 320;
+            g_mg_spawn_ms = 340;
             for (int i = 0; i < MAX_FALL_ITEMS; i++) {
                 if (!g_mg_items[i].active) {
                     g_mg_items[i].active = 1;
                     g_mg_items[i].x = 70 + rng_next(sw - 140);
-                    g_mg_items[i].y = 66;
-                    g_mg_items[i].vy = 5 + rng_next(5);
+                    g_mg_items[i].y = 56;
+                    g_mg_items[i].vy = 6 + rng_next(5);
                     int r = rng_next(10);
                     g_mg_items[i].type = (r < 6) ? 0 : ((r < 8) ? 1 : 2);
                     break;
                 }
             }
         }
-        int py = sh - 86;
+        int py = sh - 84;
         for (int i = 0; i < MAX_FALL_ITEMS; i++) {
             if (!g_mg_items[i].active) continue;
             g_mg_items[i].y += g_mg_items[i].vy;
             if (abs(g_mg_items[i].x - g_mg_px) < 30 && abs(g_mg_items[i].y - py) < 28) {
                 if (g_mg_items[i].type == 0) g_mg_score += 5;
                 else if (g_mg_items[i].type == 1) g_mg_score += 15;
-                else { g_mg_score -= 15; if (g_mg_score < 0) g_mg_score = 0; gfx_add_shake(260, 6); }
+                else { g_mg_score -= 15; if (g_mg_score < 0) g_mg_score = 0; }
                 g_mg_items[i].active = 0;
-            } else if (g_mg_items[i].y > sh - 50) g_mg_items[i].active = 0;
+            } else if (g_mg_items[i].y > sh - 54) g_mg_items[i].active = 0;
         }
         if (g_mg_time_ms <= 0) {
             g_mg_time_ms = 0; g_mg_done = 1;
             g.players[g.cur_player].coupons += g_mg_score;
             char cb[128];
-            snprintf(cb, sizeof(cb), "P%d %s 在接金幣大作戰狂賺 +%d 點券！", g.cur_player + 1, g.players[g.cur_player].name, g_mg_score);
+            snprintf(cb, sizeof(cb), "P%d %s 在接金幣大作戰賺得 +%d 點券！", g.cur_player + 1, g.players[g.cur_player].name, g_mg_score);
             push_feed(0xFFEA00, cb);
+            request_full_redraw();
+        } else {
+            request_partial(RM_COINS);
         }
         return;
     }
 }
 
-int game_needs_redraw(void) { return g_dirty; }
+int game_needs_redraw(void) { return (g_render_mode != RM_NONE); }
 
 void game_init(void) {
     g_rng = hal_get_seed();
     if (g_rng == 0) g_rng = 0x5A3C9E11u;
     g_state = ST_TITLE;
     g_menu_sel = 0;
-    g_dirty = 1;
+    request_full_redraw();
 }
 
 void game_shutdown(void) {
@@ -1619,24 +1587,82 @@ void game_shutdown(void) {
 }
 
 /* ============================================================
- * 按鍵事件處理
+ * 按鍵事件處理 (含全域 ESC 暫停選單!)
  * ============================================================ */
 void game_on_key(GameKey key) {
     g_rng ^= (uint32_t)key * 2654435761u;
     rng_next(7);
-    g_dirty = 1;
     int is_confirm = (key == GKEY_OK || key == GKEY_SPACE);
 
-    /* AI 行動停頓時按 Enter/空白 立即跳下一位，或切換加速模式 */
+    /* 1. ESC 暫停選單內部控制 */
+    if (g_state == ST_PAUSE_MENU) {
+        if (key == GKEY_BACK) {
+            g_state = g_paused_state;
+            request_full_redraw();
+            return;
+        }
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_pause_sel = (g_pause_sel + 6) % 7; request_full_redraw(); return; }
+        if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_pause_sel = (g_pause_sel + 1) % 7; request_full_redraw(); return; }
+        if (is_confirm) {
+            switch (g_pause_sel) {
+                case 0: /* 繼續遊戲 */
+                    g_state = g_paused_state;
+                    request_full_redraw();
+                    break;
+                case 1: { /* 立即存檔 */
+                    int ok = save_game();
+                    show_msg("存檔結果", ok ? "遊戲進度已儲存至 C:\\richman4_3d.sav！" : "存檔失敗！", "", "", ST_PAUSE_MENU);
+                    break;
+                }
+                case 2: /* 切換 AI 速度 */
+                    g_fast_ai = !g_fast_ai;
+                    request_full_redraw();
+                    break;
+                case 3: /* 全體資產總覽 */
+                    g_sub_return_state = ST_PAUSE_MENU;
+                    g_state = ST_STATUS_VIEW;
+                    request_full_redraw();
+                    break;
+                case 4: /* 操作說明 */
+                    g_sub_return_state = ST_PAUSE_MENU;
+                    g_state = ST_HELP_VIEW;
+                    request_full_redraw();
+                    break;
+                case 5: /* 返回主標題 */
+                    save_game();
+                    g_state = ST_TITLE;
+                    g_menu_sel = 0;
+                    request_full_redraw();
+                    break;
+                case 6: /* 離開遊戲 */
+                    save_game();
+                    hal_request_quit();
+                    break;
+            }
+        }
+        return;
+    }
+
+    /* 2. 在任何進行中的主畫面 / 動畫 / AI 回合按 ESC -> 立刻暫停並開啟暫停選單！ */
+    if (key == GKEY_BACK) {
+        if (g_state == ST_TURN_MENU || g_state == ST_AI_THINK || g_state == ST_AI_PAUSE ||
+            g_state == ST_DICE_ANIM || g_state == ST_WALK_ANIM || g_state == ST_CARD_FX) {
+            open_pause_menu();
+            return;
+        }
+    }
+
+    /* AI 停頓/行動中按空白鍵快速跳過或加速 */
     if (g_state == ST_AI_PAUSE) {
-        if (is_confirm) { advance_turn(); return; }
+        if (is_confirm) advance_turn();
         return;
     }
     if (g_state == ST_AI_THINK ||
         ((g_state == ST_DICE_ANIM || g_state == ST_WALK_ANIM) && g.players[g.cur_player].is_ai)) {
         if (key == GKEY_SPACE || key == GKEY_OK) {
             g_fast_ai = !g_fast_ai;
-            set_banner(g_fast_ai ? "AI 高速播報：開啟 (按空白回原速)" : "AI 高速播報：關閉", 900);
+            set_banner(g_fast_ai ? "AI 高速模式：開啟 (按空白回原速 / ESC暫停)" : "AI 高速模式：關閉");
+            request_full_redraw();
         }
         return;
     }
@@ -1644,11 +1670,11 @@ void game_on_key(GameKey key) {
     if (g_state == ST_TITLE) {
         int has_sav = has_save_file();
         int max_opt = has_sav ? 3 : 2;
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + max_opt - 1) % max_opt;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % max_opt;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + max_opt - 1) % max_opt; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % max_opt; request_full_redraw(); }
         else if (is_confirm) {
             if (has_sav && g_menu_sel == 0) load_game();
-            else if ((has_sav && g_menu_sel == 1) || (!has_sav && g_menu_sel == 0)) { g_setup_row = 0; g_state = ST_SETUP; }
+            else if ((has_sav && g_menu_sel == 1) || (!has_sav && g_menu_sel == 0)) { g_setup_row = 0; g_state = ST_SETUP; request_full_redraw(); }
             else hal_request_quit();
         } else if (key == GKEY_BACK) hal_request_quit();
         return;
@@ -1668,26 +1694,27 @@ void game_on_key(GameKey key) {
             else if (g_setup_row == 2) g_setup_p1_char = (g_setup_p1_char + 1) % NUM_CHARS;
             else if (g_setup_row == 3) g_setup_win = (g_setup_win + 1) % 3;
         } else if (is_confirm) {
-            if (g_setup_row == 4 || key == GKEY_OK) start_new_game();
+            if (g_setup_row == 4 || key == GKEY_OK) { start_new_game(); return; }
         } else if (key == GKEY_BACK) { g_state = ST_TITLE; g_menu_sel = 0; }
+        request_full_redraw();
         return;
     }
 
     if (g_state == ST_MESSAGE) {
         if (is_confirm || key == GKEY_BACK) {
             if (g_msg_next_state == ST_GAME_OVER) advance_turn();
-            else g_state = g_msg_next_state;
+            else { g_state = g_msg_next_state; request_full_redraw(); }
         }
         return;
     }
 
     if (g_state == ST_GAME_OVER) {
-        if (is_confirm || key == GKEY_BACK) { g_state = ST_TITLE; g_menu_sel = 0; }
+        if (is_confirm || key == GKEY_BACK) { g_state = ST_TITLE; g_menu_sel = 0; request_full_redraw(); }
         return;
     }
 
     if (g_state == ST_STATUS_VIEW || g_state == ST_HELP_VIEW) {
-        if (is_confirm || key == GKEY_BACK) g_state = ST_TURN_MENU;
+        if (is_confirm || key == GKEY_BACK) { g_state = g_sub_return_state; request_full_redraw(); }
         return;
     }
 
@@ -1698,43 +1725,43 @@ void game_on_key(GameKey key) {
         else if (key == GKEY_PGDN) g_free_cursor = (g_free_cursor + 5) % m->tile_count;
         else if (key == GKEY_PGUP) g_free_cursor = (g_free_cursor + m->tile_count - 5) % m->tile_count;
         else if (key == GKEY_BACK || key == GKEY_MAP || is_confirm) {
-            focus_camera_on_player(g.cur_player, 0);
+            snap_camera_to_player(g.cur_player);
             g_state = ST_TURN_MENU;
             return;
         }
         int wx, wy; tile_iso_center(g_free_cursor, &wx, &wy);
-        focus_camera_on_world(wx, wy, 0);
+        snap_camera_to_world(wx, wy);
         return;
     }
 
     if (g_state == ST_TURN_MENU) {
-        if (key == GKEY_CARD) { g_menu_sel = 0; g_state = ST_CARD_BAG; return; }
-        if (key == GKEY_STOCK) { g_stock_sel = 0; g_state = ST_STOCK_MARKET; return; }
-        if (key == GKEY_MAP) { g_free_cursor = g.players[g.cur_player].pos; g_state = ST_FREE_MAP; return; }
-        if (key == GKEY_HELP) { g_state = ST_HELP_VIEW; return; }
+        if (key == GKEY_CARD) { g_menu_sel = 0; g_state = ST_CARD_BAG; request_full_redraw(); return; }
+        if (key == GKEY_STOCK) { g_stock_sel = 0; g_state = ST_STOCK_MARKET; request_full_redraw(); return; }
+        if (key == GKEY_MAP) { g_free_cursor = g.players[g.cur_player].pos; g_state = ST_FREE_MAP; request_full_redraw(); return; }
+        if (key == GKEY_HELP) { g_sub_return_state = ST_TURN_MENU; g_state = ST_HELP_VIEW; request_full_redraw(); return; }
         if (key == GKEY_SAVE) {
             int ok = save_game();
             show_msg("存檔結果", ok ? "3D 進度已儲存至 C:\\richman4_3d.sav！" : "存檔失敗！", "", "", ST_TURN_MENU);
             return;
         }
 
-        if (key == GKEY_LEFT || key == GKEY_UP) g_menu_sel = (g_menu_sel + 6) % 7;
-        else if (key == GKEY_RIGHT || key == GKEY_DOWN) g_menu_sel = (g_menu_sel + 1) % 7;
+        if (key == GKEY_LEFT || key == GKEY_UP) { g_menu_sel = (g_menu_sel + 6) % 7; request_full_redraw(); }
+        else if (key == GKEY_RIGHT || key == GKEY_DOWN) { g_menu_sel = (g_menu_sel + 1) % 7; request_full_redraw(); }
         else if (is_confirm) {
             switch (g_menu_sel) {
                 case 0: begin_dice_roll(g.cur_player); break;
-                case 1: g_menu_sel = 0; g_state = ST_CARD_BAG; break;
-                case 2: g_stock_sel = 0; g_state = ST_STOCK_MARKET; break;
-                case 3: g_free_cursor = g.players[g.cur_player].pos; g_state = ST_FREE_MAP; break;
-                case 4: g_state = ST_STATUS_VIEW; break;
+                case 1: g_menu_sel = 0; g_state = ST_CARD_BAG; request_full_redraw(); break;
+                case 2: g_stock_sel = 0; g_state = ST_STOCK_MARKET; request_full_redraw(); break;
+                case 3: g_free_cursor = g.players[g.cur_player].pos; g_state = ST_FREE_MAP; request_full_redraw(); break;
+                case 4: g_sub_return_state = ST_TURN_MENU; g_state = ST_STATUS_VIEW; request_full_redraw(); break;
                 case 5: {
                     int ok = save_game();
                     show_msg("存檔結果", ok ? "3D 進度已儲存至 C:\\richman4_3d.sav！" : "存檔失敗！", "", "", ST_TURN_MENU);
                     break;
                 }
-                case 6: save_game(); g_state = ST_TITLE; g_menu_sel = 0; break;
+                case 6: open_pause_menu(); break;
             }
-        } else if (key == GKEY_BACK) g_state = ST_HELP_VIEW;
+        }
         return;
     }
 
@@ -1743,25 +1770,20 @@ void game_on_key(GameKey key) {
         const MapDef *m = cur_map();
         const TileDef *td = &m->tiles[p->pos];
         TileState *ts = &g.tiles[p->pos];
-        int wx, wy; tile_iso_center(p->pos, &wx, &wy);
 
-        if (key == GKEY_LEFT || key == GKEY_RIGHT || key == GKEY_UP || key == GKEY_DOWN) g_menu_sel = 1 - g_menu_sel;
+        if (key == GKEY_LEFT || key == GKEY_RIGHT || key == GKEY_UP || key == GKEY_DOWN) { g_menu_sel = 1 - g_menu_sel; request_full_redraw(); }
         else if (is_confirm) {
             if (g_menu_sel == 0) {
                 char fb[128];
                 if (ts->owner < 0) {
                     int cost = (p->god == GOD_FORTUNE) ? 0 : td->base_price;
                     p->cash -= cost; ts->owner = g.cur_player; ts->level = 0;
-                    gfx_spawn_sparkles(wx, wy, PLAYER_COLORS[g.cur_player], 18);
-                    gfx_spawn_popup(wx - 18, wy - 36, "BUY!", 0xFFD54F);
-                    if (td->type == TILE_COMMERCIAL) { g_menu_sel = 0; g_state = ST_BUILD_COMM; return; }
+                    if (td->type == TILE_COMMERCIAL) { g_menu_sel = 0; g_state = ST_BUILD_COMM; request_full_redraw(); return; }
                     snprintf(fb, sizeof(fb), "P%d %s 買下了 [%s]！", g.cur_player + 1, p->name, td->name);
                     push_feed(PLAYER_COLORS[g.cur_player], fb);
                 } else {
                     int cost = (p->god == GOD_FORTUNE) ? 0 : (td->base_price / 2);
                     p->cash -= cost; ts->level++;
-                    gfx_spawn_sparkles(wx, wy, 0xFFEA00, 22);
-                    gfx_spawn_popup(wx - 22, wy - 36, "LV UP!", 0xFFEA00);
                     snprintf(fb, sizeof(fb), "P%d %s 將 [%s] 升級成 Lv.%d 3D大樓！", g.cur_player + 1, p->name, td->name, ts->level);
                     push_feed(PLAYER_COLORS[g.cur_player], fb);
                 }
@@ -1774,12 +1796,10 @@ void game_on_key(GameKey key) {
     if (g_state == ST_BUILD_COMM) {
         Player *p = &g.players[g.cur_player];
         TileState *ts = &g.tiles[p->pos];
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + 4) % 5;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % 5;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + 4) % 5; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % 5; request_full_redraw(); }
         else if (is_confirm) {
             ts->comm = (CommType)(g_menu_sel + 1);
-            int wx, wy; tile_iso_center(p->pos, &wx, &wy);
-            gfx_spawn_sparkles(wx, wy, 0xFFEA00, 22);
             char fb[128];
             snprintf(fb, sizeof(fb), "P%d %s 興建了 3D [%s]！", g.cur_player + 1, p->name, COMM_NAMES[ts->comm]);
             push_feed(PLAYER_COLORS[g.cur_player], fb);
@@ -1790,10 +1810,10 @@ void game_on_key(GameKey key) {
 
     if (g_state == ST_CARD_BAG) {
         Player *p = &g.players[g.cur_player];
-        if (key == GKEY_BACK || key == GKEY_CARD) { g_state = ST_TURN_MENU; g_menu_sel = 0; return; }
+        if (key == GKEY_BACK || key == GKEY_CARD) { g_state = ST_TURN_MENU; g_menu_sel = 0; request_full_redraw(); return; }
         if (p->card_count == 0) return;
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + p->card_count - 1) % p->card_count;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % p->card_count;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + p->card_count - 1) % p->card_count; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % p->card_count; request_full_redraw(); }
         else if (is_confirm) {
             CardType ct = (CardType)p->cards[g_menu_sel];
             if (ct == CARD_MOTO || ct == CARD_CAR || ct == CARD_ROADBLOCK || ct == CARD_LANDMINE ||
@@ -1802,7 +1822,7 @@ void game_on_key(GameKey key) {
                 execute_card(g.cur_player, g_menu_sel, g.cur_player);
             } else {
                 g_pending_card_idx = g_menu_sel; g_pending_card_type = (int)ct;
-                g_menu_sel = 0; g_state = ST_CARD_TARGET;
+                g_menu_sel = 0; g_state = ST_CARD_TARGET; request_full_redraw();
             }
         }
         return;
@@ -1811,9 +1831,9 @@ void game_on_key(GameKey key) {
     if (g_state == ST_CARD_TARGET) {
         CardType ct = (CardType)g_pending_card_type;
         int max_t = (ct == CARD_REMOTE_DICE) ? 6 : ((ct == CARD_RED_STOCK || ct == CARD_BLACK_STOCK) ? NUM_STOCKS : MAX_PLAYERS);
-        if (key == GKEY_BACK) { g_state = ST_CARD_BAG; g_menu_sel = g_pending_card_idx; return; }
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + max_t - 1) % max_t;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % max_t;
+        if (key == GKEY_BACK) { g_state = ST_CARD_BAG; g_menu_sel = g_pending_card_idx; request_full_redraw(); return; }
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + max_t - 1) % max_t; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % max_t; request_full_redraw(); }
         else if (key >= GKEY_1 && key <= GKEY_6) {
             int num = (int)(key - GKEY_1);
             if (num < max_t) execute_card(g.cur_player, g_pending_card_idx, (ct == CARD_REMOTE_DICE) ? (num + 1) : num);
@@ -1825,7 +1845,7 @@ void game_on_key(GameKey key) {
 
     if (g_state == ST_STOCK_MARKET) {
         Player *p = &g.players[g.cur_player];
-        if (key == GKEY_BACK || key == GKEY_STOCK) { g_state = ST_TURN_MENU; g_menu_sel = 0; return; }
+        if (key == GKEY_BACK || key == GKEY_STOCK) { g_state = ST_TURN_MENU; g_menu_sel = 0; request_full_redraw(); return; }
         if (key == GKEY_UP) g_stock_sel = (g_stock_sel + NUM_STOCKS - 1) % NUM_STOCKS;
         else if (key == GKEY_DOWN) g_stock_sel = (g_stock_sel + 1) % NUM_STOCKS;
         else if (key == GKEY_RIGHT || is_confirm || key == GKEY_PGDN) {
@@ -1837,19 +1857,20 @@ void game_on_key(GameKey key) {
             int lot = (key == GKEY_PGUP) ? 500 : 100;
             if (p->stocks[g_stock_sel] >= lot) { p->stocks[g_stock_sel] -= lot; p->cash += g.stocks[g_stock_sel].price * lot; }
         }
+        request_full_redraw();
         return;
     }
 
     if (g_state == ST_BANK_MENU) {
         Player *p = &g.players[g.cur_player];
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + 5) % 6;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % 6;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + 5) % 6; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % 6; request_full_redraw(); }
         else if (is_confirm) {
-            if (g_menu_sel == 0 && p->cash >= 2000) { p->cash -= 2000; p->deposit += 2000; }
-            else if (g_menu_sel == 1 && p->deposit >= 2000) { p->deposit -= 2000; p->cash += 2000; }
-            else if (g_menu_sel == 2 && p->cash >= 5000) { p->cash -= 5000; p->deposit += 5000; }
-            else if (g_menu_sel == 3 && p->loan == 0) { p->loan = 10000; p->cash += 10000; }
-            else if (g_menu_sel == 4 && p->loan > 0 && p->cash >= p->loan) { p->cash -= p->loan; p->loan = 0; }
+            if (g_menu_sel == 0 && p->cash >= 2000) { p->cash -= 2000; p->deposit += 2000; request_full_redraw(); }
+            else if (g_menu_sel == 1 && p->deposit >= 2000) { p->deposit -= 2000; p->cash += 2000; request_full_redraw(); }
+            else if (g_menu_sel == 2 && p->cash >= 5000) { p->cash -= 5000; p->deposit += 5000; request_full_redraw(); }
+            else if (g_menu_sel == 3 && p->loan == 0) { p->loan = 10000; p->cash += 10000; request_full_redraw(); }
+            else if (g_menu_sel == 4 && p->loan > 0 && p->cash >= p->loan) { p->cash -= p->loan; p->loan = 0; request_full_redraw(); }
             else if (g_menu_sel == 5) advance_turn();
         } else if (key == GKEY_BACK) advance_turn();
         return;
@@ -1857,18 +1878,17 @@ void game_on_key(GameKey key) {
 
     if (g_state == ST_CARD_SHOP) {
         Player *p = &g.players[g.cur_player];
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + 5) % 6;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % 6;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + 5) % 6; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % 6; request_full_redraw(); }
         else if (is_confirm) {
             if (g_menu_sel == 5) advance_turn();
             else {
                 int c = g_shop_items[g_menu_sel];
                 if (p->coupons >= CARD_COSTS[c] && p->card_count < MAX_CARDS_HELD) {
-                    p->coupons -= CARD_COSTS[c];
-                    add_card(g.cur_player, (CardType)c);
-                    char fb[128];
-                    snprintf(fb, sizeof(fb), "P%d %s 購入卡片 [%s]！", g.cur_player + 1, p->name, CARD_NAMES[c]);
+                    p->coupons -= CARD_COSTS[c]; add_card(g.cur_player, (CardType)c);
+                    char fb[128]; snprintf(fb, sizeof(fb), "P%d %s 購入卡片 [%s]！", g.cur_player + 1, p->name, CARD_NAMES[c]);
                     push_feed(PLAYER_COLORS[g.cur_player], fb);
+                    request_full_redraw();
                 }
             }
         } else if (key == GKEY_BACK) advance_turn();
@@ -1878,8 +1898,8 @@ void game_on_key(GameKey key) {
     if (g_state == ST_MAGIC_HOUSE) {
         Player *p = &g.players[g.cur_player];
         const MapDef *m = cur_map();
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + 2) % 3;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % 3;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + 2) % 3; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % 3; request_full_redraw(); }
         else if (is_confirm) {
             if (g_menu_sel == 0) {
                 for (int i = 0; i < MAX_PLAYERS; i++) if (i != g.cur_player && !g.players[i].bankrupt) pay_money(i, 1500, g.cur_player);
@@ -1902,13 +1922,12 @@ void game_on_key(GameKey key) {
 
     if (g_state == ST_LOTTERY) {
         Player *p = &g.players[g.cur_player];
-        if (key == GKEY_LEFT || key == GKEY_UP) g_lottery_pick = (g_lottery_pick <= 1) ? 20 : (g_lottery_pick - 1);
-        else if (key == GKEY_RIGHT || key == GKEY_DOWN) g_lottery_pick = (g_lottery_pick >= 20) ? 1 : (g_lottery_pick + 1);
+        if (key == GKEY_LEFT || key == GKEY_UP) { g_lottery_pick = (g_lottery_pick <= 1) ? 20 : (g_lottery_pick - 1); request_full_redraw(); }
+        else if (key == GKEY_RIGHT || key == GKEY_DOWN) { g_lottery_pick = (g_lottery_pick >= 20) ? 1 : (g_lottery_pick + 1); request_full_redraw(); }
         else if (is_confirm) {
             if (p->cash >= 500) {
                 p->cash -= 500; p->lottery_num = g_lottery_pick;
-                char fb[128];
-                snprintf(fb, sizeof(fb), "P%d %s 買了 %d 號樂透彩券！", g.cur_player + 1, p->name, g_lottery_pick);
+                char fb[128]; snprintf(fb, sizeof(fb), "P%d %s 買了 %d 號樂透彩券！", g.cur_player + 1, p->name, g_lottery_pick);
                 push_feed(0xFFD54F, fb);
             }
             advance_turn();
@@ -1917,11 +1936,11 @@ void game_on_key(GameKey key) {
     }
 
     if (g_state == ST_MINIGAME_SELECT) {
-        if (key == GKEY_UP || key == GKEY_LEFT) g_menu_sel = (g_menu_sel + 2) % 3;
-        else if (key == GKEY_DOWN || key == GKEY_RIGHT) g_menu_sel = (g_menu_sel + 1) % 3;
+        if (key == GKEY_UP || key == GKEY_LEFT) { g_menu_sel = (g_menu_sel + 2) % 3; request_full_redraw(); }
+        else if (key == GKEY_DOWN || key == GKEY_RIGHT) { g_menu_sel = (g_menu_sel + 1) % 3; request_full_redraw(); }
         else if (is_confirm) {
             if (g_menu_sel == 0) start_coin_minigame();
-            else if (g_menu_sel == 1) { g_mg_dice = 0; g_mg_result[0] = '\0'; g_menu_sel = 0; g_state = ST_MG_DICE; }
+            else if (g_menu_sel == 1) { g_mg_dice = 0; g_mg_result[0] = '\0'; g_menu_sel = 0; g_state = ST_MG_DICE; request_full_redraw(); }
             else advance_turn();
         } else if (key == GKEY_BACK) advance_turn();
         return;
@@ -1930,8 +1949,8 @@ void game_on_key(GameKey key) {
     if (g_state == ST_MG_COINS) {
         int sw = hal_get_width();
         if (g_mg_done) { if (is_confirm || key == GKEY_BACK) advance_turn(); return; }
-        if (key == GKEY_LEFT) { g_mg_px -= 36; if (g_mg_px < 64) g_mg_px = 64; }
-        else if (key == GKEY_RIGHT) { g_mg_px += 36; if (g_mg_px > sw - 64) g_mg_px = sw - 64; }
+        if (key == GKEY_LEFT) { g_mg_px -= 40; if (g_mg_px < 60) g_mg_px = 60; request_partial(RM_COINS); }
+        else if (key == GKEY_RIGHT) { g_mg_px += 40; if (g_mg_px > sw - 60) g_mg_px = sw - 60; request_partial(RM_COINS); }
         else if (key == GKEY_BACK) { g_mg_done = 1; advance_turn(); }
         return;
     }
@@ -1940,8 +1959,8 @@ void game_on_key(GameKey key) {
         Player *p = &g.players[g.cur_player];
         if (key == GKEY_BACK) { advance_turn(); return; }
         if (g_mg_dice > 0) { if (is_confirm) advance_turn(); return; }
-        if (key == GKEY_LEFT || key == GKEY_UP) g_menu_sel = (g_menu_sel + 2) % 3;
-        else if (key == GKEY_RIGHT || key == GKEY_DOWN) g_menu_sel = (g_menu_sel + 1) % 3;
+        if (key == GKEY_LEFT || key == GKEY_UP) { g_menu_sel = (g_menu_sel + 2) % 3; request_full_redraw(); }
+        else if (key == GKEY_RIGHT || key == GKEY_DOWN) { g_menu_sel = (g_menu_sel + 1) % 3; request_full_redraw(); }
         else if (is_confirm) {
             if (g_menu_sel == 2) { advance_turn(); return; }
             g_mg_dice = 1 + rng_next(6);
@@ -1954,14 +1973,26 @@ void game_on_key(GameKey key) {
                 snprintf(g_mg_result, sizeof(g_mg_result), "3D骰開出 %d 點 (%s)！安慰獎 +10 點券。", g_mg_dice, is_big ? "大" : "小");
             }
             push_feed(0xFFEA00, g_mg_result);
+            request_full_redraw();
         }
         return;
     }
 }
 
 /* ============================================================
- * 3D 世界場景繪製 (Painter's Algorithm 由遠到近深度排序！)
+ * 繪圖輔助 (支援全螢幕重繪與超高速局部髒矩形更新)
  * ============================================================ */
+static void draw_banner_box(int sw) {
+    if (!g_banner_active || !g_banner_text[0]) return;
+    int bw = sw - 180;
+    if (bw > 500) bw = 500;
+    int bx = 12;
+    gfx_panel(bx, 40, bw, 32, 0x162432, PLAYER_COLORS[g.cur_player], 0, 0);
+    hal_fill_rect(bx + 4, 44, 8, 24, PLAYER_COLORS[g.cur_player]);
+    hal_set_text_bg(0x162432);
+    hal_draw_text(bx + 18, 47, g_banner_text, 0xFFEA00);
+}
+
 static void render_minimap(int sw) {
     const MapDef *m = cur_map();
     int mw = m->grid_w * 7 + 8;
@@ -1987,28 +2018,24 @@ static void render_minimap(int sw) {
     }
 }
 
-static void render_world_scene(int sw, int sh) {
+/* skip_player: 若 >= 0 則先不畫該玩家 (供行走局部刷新建立純淨背景快取) */
+static void render_world_scene(int sw, int sh, int skip_player) {
     const MapDef *m = cur_map();
-    int cx = g_cam_x + gfx_get_shake_x();
-    int cy = g_cam_y + gfx_get_shake_y();
+    int cx = g_cam_x, cy = g_cam_y;
 
-    /* 1. 3D 浮島與動態海洋背景 */
-    gfx_draw_iso_world_bg(m, cx, cy, g_tick_ms);
+    gfx_draw_iso_world_bg(m, cx, cy);
 
-    /* 2. 預先計算 4 位玩家的 3D 座標與深度 */
     int pwx[MAX_PLAYERS], pwy[MAX_PLAYERS], pjh[MAX_PLAYERS], pfl[MAX_PLAYERS], pdp[MAX_PLAYERS];
     for (int pi = 0; pi < MAX_PLAYERS; pi++) {
-        if (!g.players[pi].bankrupt) {
+        if (!g.players[pi].bankrupt && pi != skip_player) {
             player_iso_pos(pi, &pwx[pi], &pwy[pi], &pjh[pi], &pfl[pi], &pdp[pi]);
         } else {
             pdp[pi] = -999;
         }
     }
 
-    /* 3. Painter's Algorithm：由最遠 (gx+gy=0) 畫到最近，建築與角色正確互相遮擋！ */
     int max_d = m->grid_w + m->grid_h;
     for (int d = 0; d <= max_d; d++) {
-        /* 畫此深度層的所有 3D 地塊與 3D 擠出建築 */
         for (int i = 0; i < m->tile_count; i++) {
             const TileDef *td = &m->tiles[i];
             if (td->gx + td->gy != d) continue;
@@ -2018,60 +2045,44 @@ static void render_world_scene(int sw, int sh) {
             uint32_t ocol = (ts->owner >= 0) ? PLAYER_COLORS[ts->owner] : 0x607D8B;
             int cursor = (g_state == ST_FREE_MAP && i == g_free_cursor) ||
                          (g_state != ST_FREE_MAP && i == g.players[g.cur_player].pos);
-            int is_dest = (g_state == ST_WALK_ANIM && i == g_walk_to);
+            int is_dest = 0;
             gfx_draw_iso_tile(wx - cx, wy - cy, td, ts->owner, ocol, ts->level, ts->comm,
                               ts->has_roadblock, ts->has_mine, ts->map_god,
-                              calc_tile_toll(i), cursor, is_dest, g_tick_ms);
+                              calc_tile_toll(i), cursor, is_dest, 1);
         }
 
-        /* 畫此深度層的所有 3D 立體角色 (主動行動角色放最後畫) */
         for (int pass = 0; pass < 2; pass++) {
             for (int pi = 0; pi < MAX_PLAYERS; pi++) {
-                if (g.players[pi].bankrupt || pdp[pi] != d) continue;
+                if (g.players[pi].bankrupt || pi == skip_player || pdp[pi] != d) continue;
                 int is_cur = (pi == g.cur_player);
                 if ((pass == 0 && is_cur) || (pass == 1 && !is_cur)) continue;
-                int wp = (is_cur && g_state == ST_WALK_ANIM) ? g_walk_phase : 0;
-                int steps_show = (is_cur && g_state == ST_WALK_ANIM) ? g_walk_steps_left : 0;
                 gfx_draw_character_3d(pwx[pi] - cx, pwy[pi] - cy, pjh[pi],
                                       g.players[pi].char_id, pi, PLAYER_COLORS[pi],
-                                      wp, g.players[pi].vehicle, g.players[pi].god,
-                                      pfl[pi], is_cur, steps_show, g_tick_ms);
+                                      0, g.players[pi].vehicle, g.players[pi].god,
+                                      pfl[pi], is_cur, 0);
             }
         }
     }
 
-    /* 4. 3D 粒子 / 飛彈 / 飄浮金額特效 */
-    gfx_vfx_render(cx, cy);
-
-    /* 5. 頂部 HUD 狀態列 */
+    /* 頂部 HUD */
     Player *cp = &g.players[g.cur_player];
     hal_fill_rect(0, 0, sw, 32, 0x0E1924);
     hal_fill_rect(0, 32, sw, 2, PLAYER_COLORS[g.cur_player]);
     hal_fill_rect(6, 4, 14, 24, PLAYER_COLORS[g.cur_player]);
     hal_set_text_bg(0x0E1924);
     char hdr[180];
-    snprintf(hdr, sizeof(hdr), "第%d月%d日 | P%d %s%s 現金:$%d 存款:$%d 券:%d 神:%s",
+    snprintf(hdr, sizeof(hdr), "第%d月%d日 | P%d %s%s 現:$%d 存:$%d 券:%d 神:%s [ESC暫停]",
              g.month, g.day, g.cur_player + 1, cp->name, cp->is_ai ? "[AI]" : "",
              cp->cash, cp->deposit, cp->coupons, GOD_NAMES[cp->god]);
     hal_draw_text(26, 7, hdr, 0xFFFFFF);
 
-    /* 6. 右上即時小地圖 */
     render_minimap(sw);
+    draw_banner_box(sw);
+    g_banner_dirty = 0;
 
-    /* 7. 上方醒目動態播報橫幅 (角色開始移動/擲骰/用卡時全程顯示!) */
-    if (g_banner_timer > 0 && g_banner_text[0]) {
-        int bw = sw - 180;
-        if (bw > 500) bw = 500;
-        int bx = 12;
-        gfx_panel(bx, 40, bw, 34, 0x162432, PLAYER_COLORS[g.cur_player], 0, 0);
-        hal_fill_rect(bx + 4, 45, 8, 24, PLAYER_COLORS[g.cur_player]);
-        hal_set_text_bg(0x162432);
-        hal_draw_text(bx + 18, 48, g_banner_text, 0xFFEA00);
-    }
-
-    /* 8. 左下角即時 4 條動態戰報框 (當沒有全螢幕選單遮擋時始終顯示，絕不漏看任何動作！) */
     int show_feed = (g_state == ST_TURN_MENU || g_state == ST_AI_THINK || g_state == ST_DICE_ANIM ||
-                     g_state == ST_WALK_ANIM || g_state == ST_AI_PAUSE || g_state == ST_CARD_FX);
+                     g_state == ST_WALK_ANIM || g_state == ST_AI_PAUSE || g_state == ST_CARD_FX ||
+                     g_state == ST_PAUSE_MENU);
     if (show_feed && g_feed_count > 0) {
         int fw = 420;
         if (fw > sw - 24) fw = sw - 24;
@@ -2088,32 +2099,236 @@ static void render_world_scene(int sw, int sh) {
     }
 }
 
+static void draw_dice_overlay(int sw, int sh) {
+    Player *cp = &g.players[g.cur_player];
+    int reveal_ms = (cp->is_ai && g_fast_ai) ? 150 : 420;
+    int rolling = (g_dice_timer > reveal_ms);
+    int elapsed = g_dice_total_dur - g_dice_timer;
+    int roll_span = g_dice_total_dur - reveal_ms;
+    if (roll_span < 1) roll_span = 1;
+
+    int bounce_h = 0;
+    if (rolling) {
+        bounce_h = (elapsed * (roll_span - elapsed) * 140) / (roll_span * roll_span) + 8;
+    } else {
+        int rem = g_dice_timer;
+        bounce_h = (rem > reveal_ms / 2) ? ((rem - reveal_ms / 2) / 14) : 0;
+    }
+
+    int start_x = sw / 2 - (g_dice_count - 1) * 52;
+    for (int i = 0; i < g_dice_count; i++) {
+        gfx_draw_3d_dice(start_x + i * 104, sh / 2 - 4, g_dice_vals[i], rolling, bounce_h, g_tick_ms, i + 1);
+    }
+    if (!rolling) {
+        char tb[24];
+        snprintf(tb, sizeof(tb), "GO %d!", g_dice_total);
+        gfx_draw_ascii(sw / 2 - 42, sh / 2 + 48, tb, 3, 0xFFEA00, 1);
+    }
+}
+
+static uint32_t tile_top_color(TileType t) {
+    if (t == TILE_START || t == TILE_BANK) return 0xFFF3CD;
+    if (t == TILE_COMMERCIAL) return 0xFCE4EC;
+    if (t == TILE_NEWS) return 0xE3F2FD;
+    if (t == TILE_SHOP) return 0xE8F5E9;
+    if (t == TILE_MAGIC) return 0xF3E5F5;
+    if (t == TILE_MINIGAME || t == TILE_LOTTERY) return 0xFFF8E1;
+    if (t == TILE_HOSPITAL || t == TILE_PRISON) return 0xECEFF1;
+    return 0xF5EFE0;
+}
+
+/* 只更新移動中的角色髒矩形 (超高速 + 零文字閃爍!) */
+static void render_walk_partial(int sw, int sh) {
+    int pi = g.cur_player;
+    int wx, wy, jh, fl, dp;
+    player_iso_pos(pi, &wx, &wy, &jh, &fl, &dp);
+    int sx = wx - g_cam_x;
+    int sy = wy - g_cam_y;
+
+    /* 角色含跳躍、步數氣泡與陰影的精準包圍盒 */
+    int cx0 = sx - 38;
+    int cy0 = sy - jh - 92;
+    int cw  = 84;
+    int ch  = jh + 114;
+
+    /* 合併上一幀與這一幀的區域，一次清除殘影並畫上新位置 */
+    int ux0 = cx0, uy0 = cy0, ux1 = cx0 + cw, uy1 = cy0 + ch;
+    if (g_prev_w > 0) {
+        if (g_prev_x < ux0) ux0 = g_prev_x;
+        if (g_prev_y < uy0) uy0 = g_prev_y;
+        if (g_prev_x + g_prev_w > ux1) ux1 = g_prev_x + g_prev_w;
+        if (g_prev_y + g_prev_h > uy1) uy1 = g_prev_y + g_prev_h;
+    }
+    if (uy0 < 78) uy0 = 78;
+    if (ux0 < 0) ux0 = 0;
+    if (ux1 > sw) ux1 = sw;
+    if (uy1 > sh) uy1 = sh;
+
+    int uw = ux1 - ux0;
+    int uh = uy1 - uy0;
+
+    hal_begin_partial();
+    if (uw > 0 && uh > 0) {
+        hal_restore_bg_rect(ux0, uy0, uw, uh);
+        /* 僅補畫與角色局部區域重疊的 1~2 格地名，其餘畫面文字零重繪零閃爍 */
+        const MapDef *m = cur_map();
+        for (int i = 0; i < m->tile_count; i++) {
+            int tx, ty;
+            tile_iso_center(i, &tx, &ty);
+            int tsx = tx - g_cam_x, tsy = ty - g_cam_y;
+            if (tsx + 34 >= ux0 && tsx - 34 <= ux1 && tsy + 22 >= uy0 && tsy - 4 <= uy1) {
+                if (tsx > 28 && tsx < sw - 54 && tsy > 44 && tsy < sh - 66) {
+                    hal_set_text_bg(tile_top_color(m->tiles[i].type));
+                    hal_draw_text(tsx - 26, tsy + 2, m->tiles[i].name, 0x1A1A1A);
+                }
+            }
+        }
+        gfx_draw_character_3d(sx, sy, jh, g.players[pi].char_id, pi, PLAYER_COLORS[pi],
+                              g_walk_phase, g.players[pi].vehicle, g.players[pi].god,
+                              fl, 1, g_walk_steps_left);
+        hal_present_rect(ux0, uy0, uw, uh);
+    }
+
+    /* 若本步換了新目的地，單獨刷新上方播報欄 (完全不影響地圖) */
+    if (g_banner_dirty) {
+        int bw = sw - 180; if (bw > 500) bw = 500;
+        hal_begin_partial();
+        draw_banner_box(sw);
+        hal_present_rect(12, 40, bw + 6, 38);
+        g_banner_dirty = 0;
+    }
+
+    g_prev_x = cx0; g_prev_y = cy0; g_prev_w = cw; g_prev_h = ch;
+}
+
+static void render_coins_playfield(int sw, int sh) {
+    hal_begin_partial();
+    hal_restore_bg_rect(0, 40, sw, sh - 40);
+
+    for (int i = 0; i < MAX_FALL_ITEMS; i++) {
+        if (!g_mg_items[i].active) continue;
+        int ix = g_mg_items[i].x, iy = g_mg_items[i].y;
+        if (g_mg_items[i].type == 0) {
+            hal_fill_circle(ix, iy, 10, 0xFFB300); hal_draw_circle(ix, iy, 10, 0xFFF176);
+            gfx_draw_ascii(ix - 3, iy - 3, "$", 1, 0xFFFFFF, 0);
+        } else if (g_mg_items[i].type == 1) {
+            hal_fill_circle(ix, iy, 10, 0x00E5FF); hal_draw_circle(ix, iy, 10, 0xFFFFFF);
+            gfx_draw_ascii(ix - 3, iy - 3, "*", 1, 0xFFFFFF, 0);
+        } else {
+            hal_fill_circle(ix, iy, 11, 0x212121); hal_draw_circle(ix, iy, 11, 0xFF1744);
+            hal_fill_circle(ix, iy - 12, 3, 0xFF9100);
+        }
+    }
+    Player *cp = &g.players[g.cur_player];
+    gfx_draw_character_3d(g_mg_px, sh - 74, 0, cp->char_id, g.cur_player, PLAYER_COLORS[g.cur_player],
+                          (g_tick_ms / 120) & 1, 0, GOD_NONE, 0, 1, 0);
+    hal_present_rect(0, 40, sw, sh - 40);
+
+    /* 只有秒數或分數變動時才更新頂部文字條 */
+    int sec = (g_mg_time_ms + 999) / 1000;
+    if (sec != g_mg_last_sec || g_mg_score != g_mg_last_score) {
+        g_mg_last_sec = sec;
+        g_mg_last_score = g_mg_score;
+        hal_begin_partial();
+        hal_fill_rect(0, 0, sw, 38, 0x0D1B2A);
+        hal_set_text_bg(0x0D1B2A);
+        char mh[128];
+        snprintf(mh, sizeof(mh), "【接金幣大作戰】 剩餘:%d秒  已獲點券:%d  (←/→ 移動躲炸彈!)", sec, g_mg_score);
+        hal_draw_text(16, 10, mh, 0xFFD54F);
+        hal_present_rect(0, 0, sw, 38);
+    }
+}
+
 void game_render(void) {
     int sw = hal_get_width();
     int sh = hal_get_height();
-    g_dirty = 0;
+    RenderMode mode = g_render_mode;
+    g_render_mode = RM_NONE;
+    if (mode == RM_NONE) return;
 
-    /* 1. 3D 動態標題封面 (含旋轉 3D 骰子與 4 位立體角色！) */
+    /* === 超高速局部更新路徑 (零文字閃爍、10倍流暢度!) === */
+    if (mode == RM_TITLE_DICE && g_state == ST_TITLE && g_cache_ready) {
+        int pw = 500, px = (sw - pw) / 2, py = 28;
+        int dcx = px + pw / 2, dcy = py + 106;
+        hal_begin_partial();
+        hal_restore_bg_rect(dcx - 46, dcy - 48, 92, 96);
+        gfx_draw_3d_dice(dcx, dcy, 6, 1, 6, g_tick_ms, 1);
+        hal_present_rect(dcx - 46, dcy - 48, 92, 96);
+        return;
+    }
+
+    if (mode == RM_DICE && g_state == ST_DICE_ANIM && g_cache_ready) {
+        int dw = g_dice_count * 108 + 44;
+        int dh = 196;
+        int dx = (sw - dw) / 2;
+        int dy = (sh / 2) - 108;
+        hal_begin_partial();
+        hal_restore_bg_rect(dx, dy, dw, dh);
+        draw_dice_overlay(sw, sh);
+        hal_present_rect(dx, dy, dw, dh);
+        if (g_banner_dirty) {
+            int bw = sw - 180; if (bw > 500) bw = 500;
+            hal_begin_partial();
+            draw_banner_box(sw);
+            hal_present_rect(12, 40, bw + 6, 38);
+            g_banner_dirty = 0;
+        }
+        return;
+    }
+
+    if (mode == RM_WALK && g_state == ST_WALK_ANIM && g_cache_ready) {
+        render_walk_partial(sw, sh);
+        return;
+    }
+
+    if (mode == RM_VFX && g_state == ST_CARD_FX && g_cache_ready) {
+        int bx, by, bw, bh;
+        int has_v = gfx_vfx_get_bounds(g_cam_x, g_cam_y, &bx, &by, &bw, &bh);
+        int ux0 = has_v ? bx : g_prev_x;
+        int uy0 = has_v ? by : g_prev_y;
+        int ux1 = has_v ? (bx + bw) : (g_prev_x + g_prev_w);
+        int uy1 = has_v ? (by + bh) : (g_prev_y + g_prev_h);
+        if (g_prev_w > 0 && has_v) {
+            if (g_prev_x < ux0) ux0 = g_prev_x;
+            if (g_prev_y < uy0) uy0 = g_prev_y;
+            if (g_prev_x + g_prev_w > ux1) ux1 = g_prev_x + g_prev_w;
+            if (g_prev_y + g_prev_h > uy1) uy1 = g_prev_y + g_prev_h;
+        }
+        if (uy0 < 78) uy0 = 78;
+        if (ux0 < 0) ux0 = 0;
+        if (ux1 > sw) ux1 = sw;
+        if (uy1 > sh) uy1 = sh;
+        if (ux1 > ux0 && uy1 > uy0) {
+            hal_begin_partial();
+            hal_restore_bg_rect(ux0, uy0, ux1 - ux0, uy1 - uy0);
+            gfx_vfx_render(g_cam_x, g_cam_y);
+            hal_present_rect(ux0, uy0, ux1 - ux0, uy1 - uy0);
+        }
+        if (has_v) { g_prev_x = bx; g_prev_y = by; g_prev_w = bw; g_prev_h = bh; }
+        else g_prev_w = 0;
+        return;
+    }
+
+    if (mode == RM_COINS && g_state == ST_MG_COINS && g_cache_ready) {
+        render_coins_playfield(sw, sh);
+        return;
+    }
+
+    /* === 完整畫面重繪路徑 (切狀態 / 開選單 / 換鏡頭時執行) === */
     if (g_state == ST_TITLE) {
         hal_clear(0x0B1929);
-        for (int gx = 0; gx < sw; gx += 40) hal_fill_rect(gx, 0, 1, sh, 0x13263C);
-        for (int gy = 0; gy < sh; gy += 40) hal_fill_rect(0, gy, sw, 1, 0x13263C);
-
-        int pw = 500, ph = sh - 56;
-        int px = (sw - pw) / 2, py = 28;
+        int pw = 500, ph = sh - 56, px = (sw - pw) / 2, py = 28;
         gfx_panel(px, py, pw, ph, 0x162536, 0xFFD54F, 0x0D47A1, 52);
         hal_set_text_bg(0x0D47A1);
-        hal_draw_text(px + 92, py + 15, "大富翁 4 Fun — CD-952 3D 立體版", 0xFFD54F);
+        hal_draw_text(px + 84, py + 15, "大富翁 4 Fun — CD-952 流暢 3D 版", 0xFFD54F);
 
-        /* 封面左右展示 3D 人物，正中央展示旋轉中的真 3D 骰子 */
-        gfx_draw_character_3d(px + 74,  py + 128, 0, 0, 0, PLAYER_COLORS[0], 0, 0, GOD_WEALTH, 0, 0, 0, g_tick_ms);
-        gfx_draw_character_3d(px + 150, py + 128, 0, 1, 1, PLAYER_COLORS[1], 1, 1, GOD_NONE,   0, 0, 0, g_tick_ms);
-        gfx_draw_3d_dice(px + pw / 2, py + 106, 6, 1, 6, g_tick_ms, 1);
-        gfx_draw_character_3d(px + pw - 150, py + 128, 0, 2, 2, PLAYER_COLORS[2], 0, 0, GOD_NONE, 1, 0, 0, g_tick_ms);
-        gfx_draw_character_3d(px + pw - 74,  py + 128, 0, 3, 3, PLAYER_COLORS[3], 1, 2, GOD_NONE, 1, 0, 0, g_tick_ms);
+        gfx_draw_character_3d(px + 74,       py + 128, 0, 0, 0, PLAYER_COLORS[0], 0, 0, GOD_WEALTH, 0, 0, 0);
+        gfx_draw_character_3d(px + 150,      py + 128, 0, 1, 1, PLAYER_COLORS[1], 1, 1, GOD_NONE,   0, 0, 0);
+        gfx_draw_character_3d(px + pw - 150, py + 128, 0, 2, 2, PLAYER_COLORS[2], 0, 0, GOD_NONE,   1, 0, 0);
+        gfx_draw_character_3d(px + pw - 74,  py + 128, 0, 3, 3, PLAYER_COLORS[3], 1, 2, GOD_NONE,   1, 0, 0);
 
         hal_set_text_bg(0x162536);
-        hal_draw_text(px + 56, py + 156, "2.5D斜角立體大地圖 / 真3D骰子 / 全程行動即時播報", 0x80CBC4);
+        hal_draw_text(px + 48, py + 156, "零震動極速3D引擎 / ESC暫停選單 / 3大環島地圖", 0x80CBC4);
 
         int has_sav = has_save_file();
         const char *o1[3] = { "繼續上次進度 (讀取存檔)", "開始全新 3D 大富翁冒險", "離開遊戲" };
@@ -2128,15 +2343,17 @@ void game_render(void) {
         }
         hal_set_text_bg(0x162536);
         hal_draw_text(px + 104, py + ph - 30, "[↑/↓]選擇   [Enter/空白]確認   [ESC]離開", 0xB0BEC5);
+
+        /* 先存下不含中央骰子的靜態封面快取，再畫上旋轉 3D 骰子 */
+        g_cache_ready = hal_save_bg_cache();
+        gfx_draw_3d_dice(px + pw / 2, py + 106, 6, 1, 6, g_tick_ms, 1);
         hal_present();
         return;
     }
 
-    /* 2. 開局設定 */
     if (g_state == ST_SETUP) {
         hal_clear(0x0B1929);
-        int pw = 540, ph = sh - 56;
-        int px = (sw - pw) / 2, py = 28;
+        int pw = 540, ph = sh - 56, px = (sw - pw) / 2, py = 28;
         gfx_panel(px, py, pw, ph, 0x162536, 0x4FC3F7, 0x1565C0, 40);
         hal_set_text_bg(0x1565C0);
         hal_draw_text(px + 150, py + 11, "3D 大富翁開局設定 (←/→ 切換)", 0xFFFFFF);
@@ -2156,18 +2373,16 @@ void game_render(void) {
             hal_set_text_bg(bg);
             hal_draw_text(px + 38, py + 72 + i * 54, rows[i], 0xFFFFFF);
         }
-        gfx_draw_character_3d(px + pw - 58, py + 196, 0, g_setup_p1_char, 0, PLAYER_COLORS[0], 0, 0, GOD_NONE, 0, 1, 0, g_tick_ms);
+        gfx_draw_character_3d(px + pw - 58, py + 196, 0, g_setup_p1_char, 0, PLAYER_COLORS[0], 0, 0, GOD_NONE, 0, 1, 0);
         hal_set_text_bg(0x162536);
         hal_draw_text(px + 28, py + ph - 32, sm->subtitle, 0xFFD54F);
         hal_present();
         return;
     }
 
-    /* 3. 勝利結算 */
     if (g_state == ST_GAME_OVER) {
         hal_clear(0x0B1929);
-        int pw = 460, ph = 290;
-        int px = (sw - pw) / 2, py = (sh - ph) / 2;
+        int pw = 460, ph = 290, px = (sw - pw) / 2, py = (sh - ph) / 2;
         gfx_panel(px, py, pw, ph, 0x162536, 0xFFD54F, 0xE65100, 44);
         hal_set_text_bg(0xE65100);
         hal_draw_text(px + 148, py + 12, "【最終大富翁誕生】", 0xFFFFFF);
@@ -2178,43 +2393,31 @@ void game_render(void) {
                      g.win_player + 1, g.players[g.win_player].name, calc_net_worth(g.win_player));
             hal_draw_text(px + 42, py + 80, wb, 0x69F0AE);
             gfx_draw_character_3d(px + pw / 2, py + 186, 6, g.players[g.win_player].char_id, g.win_player,
-                                  PLAYER_COLORS[g.win_player], 1, 2, GOD_WEALTH, 0, 1, 0, g_tick_ms);
+                                  PLAYER_COLORS[g.win_player], 1, 2, GOD_WEALTH, 0, 1, 0);
         }
         hal_draw_text(px + 100, py + ph - 36, "[按 Enter / 空白鍵 返回主選單]", 0xFFFFFF);
         hal_present();
         return;
     }
 
-    /* 4. 即時接金幣小遊戲 */
     if (g_state == ST_MG_COINS) {
         hal_clear(0x12263A);
-        for (int i = 0; i < 20; i++) hal_fill_rect((i * 97) % sw, 45 + (i * 53) % (sh - 160), 2, 2, 0xFFF59D);
+        for (int i = 0; i < 18; i++) hal_fill_rect((i * 97) % sw, 45 + (i * 53) % (sh - 160), 2, 2, 0xFFF59D);
         hal_fill_rect(0, sh - 64, sw, 64, 0x2E7D32);
         hal_fill_rect(0, sh - 66, sw, 4, 0x81C784);
         hal_fill_rect(0, 0, sw, 38, 0x0D1B2A);
+        g_cache_ready = hal_save_bg_cache();
+
         hal_set_text_bg(0x0D1B2A);
         char mh[128];
-        snprintf(mh, sizeof(mh), "【接金幣大作戰】 剩餘:%d秒  已獲點券:%d  (←/→ 移動躲炸彈!)",
-                 (g_mg_time_ms + 999) / 1000, g_mg_score);
+        int sec = (g_mg_time_ms + 999) / 1000;
+        g_mg_last_sec = sec; g_mg_last_score = g_mg_score;
+        snprintf(mh, sizeof(mh), "【接金幣大作戰】 剩餘:%d秒  已獲點券:%d  (←/→ 移動躲炸彈!)", sec, g_mg_score);
         hal_draw_text(16, 10, mh, 0xFFD54F);
 
-        for (int i = 0; i < MAX_FALL_ITEMS; i++) {
-            if (!g_mg_items[i].active) continue;
-            int ix = g_mg_items[i].x, iy = g_mg_items[i].y;
-            if (g_mg_items[i].type == 0) {
-                hal_fill_circle(ix, iy, 10, 0xFFB300); hal_draw_circle(ix, iy, 10, 0xFFF176);
-                gfx_draw_ascii(ix - 3, iy - 3, "$", 1, 0xFFFFFF, 0);
-            } else if (g_mg_items[i].type == 1) {
-                hal_fill_circle(ix, iy, 10, 0x00E5FF); hal_draw_circle(ix, iy, 10, 0xFFFFFF);
-                gfx_draw_ascii(ix - 3, iy - 3, "*", 1, 0xFFFFFF, 0);
-            } else {
-                hal_fill_circle(ix, iy, 11, 0x212121); hal_draw_circle(ix, iy, 11, 0xFF1744);
-                hal_fill_circle(ix, iy - 12, 3, 0xFF9100);
-            }
-        }
         Player *cp = &g.players[g.cur_player];
         gfx_draw_character_3d(g_mg_px, sh - 74, 0, cp->char_id, g.cur_player, PLAYER_COLORS[g.cur_player],
-                              (g_tick_ms / 120) & 1, 0, GOD_NONE, 0, 1, 0, g_tick_ms);
+                              0, 0, GOD_NONE, 0, 1, 0);
         if (g_mg_done) {
             gfx_panel(sw / 2 - 190, sh / 2 - 60, 380, 120, 0x162536, 0xFFD54F, 0x2E7D32, 34);
             hal_set_text_bg(0x2E7D32); hal_draw_text(sw / 2 - 70, sh / 2 - 52, "【挑戰完成！】", 0xFFFFFF);
@@ -2226,17 +2429,75 @@ void game_render(void) {
         return;
     }
 
-    /* 5. 主 3D 等角世界場景 */
-    render_world_scene(sw, sh);
+    /* 主 3D 等角世界場景 */
+    if (g_state == ST_WALK_ANIM) {
+        /* 先繪製不含移動中角色的靜態世界並存入快取，再畫移動角色 */
+        render_world_scene(sw, sh, g.cur_player);
+        g_cache_ready = hal_save_bg_cache();
+
+        int wx, wy, jh, fl, dp;
+        player_iso_pos(g.cur_player, &wx, &wy, &jh, &fl, &dp);
+        int sx = wx - g_cam_x, sy = wy - g_cam_y;
+        gfx_draw_character_3d(sx, sy, jh, g.players[g.cur_player].char_id, g.cur_player,
+                              PLAYER_COLORS[g.cur_player], g_walk_phase, g.players[g.cur_player].vehicle,
+                              g.players[g.cur_player].god, fl, 1, g_walk_steps_left);
+        g_prev_x = sx - 38; g_prev_y = sy - jh - 92; g_prev_w = 84; g_prev_h = jh + 114;
+        hal_present();
+        return;
+    }
+
+    render_world_scene(sw, sh, -1);
+
+    if (g_state == ST_DICE_ANIM) {
+        g_cache_ready = hal_save_bg_cache();
+        draw_dice_overlay(sw, sh);
+        hal_present();
+        return;
+    }
+
+    if (g_state == ST_CARD_FX) {
+        g_cache_ready = hal_save_bg_cache();
+        gfx_vfx_render(g_cam_x, g_cam_y);
+        hal_present();
+        return;
+    }
 
     Player *cp = &g.players[g.cur_player];
     const MapDef *m = cur_map();
 
-    /* 6. 各互動視窗與 3D 骰子動畫疊加 */
+    /* ESC 遊戲暫停選單 */
+    if (g_state == ST_PAUSE_MENU) {
+        int pw = 360, ph = 330, px = (sw - pw) / 2, py = (sh - ph) / 2;
+        gfx_panel(px, py, pw, ph, 0x142230, 0xFFD54F, 0x1565C0, 40);
+        hal_set_text_bg(0x1565C0);
+        hal_draw_text(px + 96, py + 11, "【遊戲暫停選單】", 0xFFFFFF);
+
+        const char *opts[7];
+        opts[0] = "繼續遊戲 (ESC)";
+        opts[1] = "立即儲存進度";
+        opts[2] = g_fast_ai ? "AI 速度：高速模式" : "AI 速度：一般速度";
+        opts[3] = "全體資產排行榜";
+        opts[4] = "操作與規則說明";
+        opts[5] = "返回主標題畫面";
+        opts[6] = "存檔並離開遊戲";
+
+        for (int i = 0; i < 7; i++) {
+            uint32_t bg = (i == g_pause_sel) ? ((i == 6) ? 0xC62828 : 0x2E7D32) : 0x223446;
+            hal_fill_rect(px + 24, py + 52 + i * 38, pw - 48, 32, bg);
+            hal_draw_rect(px + 24, py + 52 + i * 38, pw - 48, 32, (i == g_pause_sel) ? 0xFFEA00 : 0x455A64);
+            hal_set_text_bg(bg);
+            char line[80];
+            snprintf(line, sizeof(line), "%s %s", (i == g_pause_sel) ? ">" : " ", opts[i]);
+            hal_draw_text(px + 38, py + 59 + i * 38, line, 0xFFFFFF);
+        }
+        hal_present();
+        return;
+    }
+
     if (g_state == ST_TURN_MENU) {
         int bar_y = sh - 52;
         gfx_panel(10, bar_y, sw - 20, 44, 0x121F2B, 0x607D8B, 0, 0);
-        const char *btns[7] = { "擲3D骰", "卡片[C]", "股市[S]", "3D地圖[M]", "資產", "存檔[F]", "主選單" };
+        const char *btns[7] = { "擲3D骰", "卡片[C]", "股市[S]", "3D地圖[M]", "資產", "存檔[F]", "暫停[ESC]" };
         int bw = (sw - 36) / 7;
         for (int i = 0; i < 7; i++) {
             uint32_t bg = (i == g_menu_sel) ? 0x2E7D32 : 0x223344;
@@ -2246,13 +2507,11 @@ void game_render(void) {
             hal_draw_text(22 + i * bw, bar_y + 13, btns[i], 0xFFFFFF);
         }
     } else if (g_state == ST_AI_PAUSE && g_ai_toast[0]) {
-        /* 醒目的 AI 行動結果通知卡，確保絕對知道 AI 做了什麼！ */
-        int pw = 480, ph = 92;
-        int px = (sw - pw) / 2, py = 86;
+        int pw = 480, ph = 92, px = (sw - pw) / 2, py = 86;
         gfx_panel(px, py, pw, ph, 0x162536, PLAYER_COLORS[g.cur_player], PLAYER_COLORS[g.cur_player], 28);
         hal_set_text_bg(PLAYER_COLORS[g.cur_player]);
         char thdr[64];
-        snprintf(thdr, sizeof(thdr), "【P%d %s 行動報告】 (按空白鍵立即繼續)", g.cur_player + 1, cp->name);
+        snprintf(thdr, sizeof(thdr), "【P%d %s 行動報告】 (空白繼續 / ESC暫停)", g.cur_player + 1, cp->name);
         hal_draw_text(px + 14, py + 6, thdr, 0xFFFFFF);
         hal_set_text_bg(0x162536);
         hal_draw_text(px + 16, py + 44, g_ai_toast, 0xFFEA00);
@@ -2270,32 +2529,6 @@ void game_render(void) {
                      g_free_cursor, td->name, td->base_price, GOD_NAMES[ts->map_god]);
         }
         hal_draw_text(24, sh - 46, info, 0xFFFFFF);
-    } else if (g_state == ST_DICE_ANIM) {
-        int reveal_ms = (cp->is_ai && g_fast_ai) ? 160 : 480;
-        int rolling = (g_dice_timer > reveal_ms);
-        int elapsed = g_dice_total_dur - g_dice_timer;
-        int roll_span = g_dice_total_dur - reveal_ms;
-        if (roll_span < 1) roll_span = 1;
-
-        /* 3D 骰子物理彈跳高度 (空中翻滾拋物線 -> 落地回彈!) */
-        int bounce_h = 0;
-        if (rolling) {
-            int p = elapsed;
-            bounce_h = (p * (roll_span - p) * 160) / (roll_span * roll_span) + 12;
-        } else {
-            int rem = g_dice_timer;
-            bounce_h = (rem > reveal_ms / 2) ? ((rem - reveal_ms / 2) / 14) : 0;
-        }
-
-        int start_x = sw / 2 - (g_dice_count - 1) * 52;
-        for (int i = 0; i < g_dice_count; i++) {
-            gfx_draw_3d_dice(start_x + i * 104, sh / 2 - 4, g_dice_vals[i], rolling, bounce_h, g_tick_ms, i + 1);
-        }
-        if (!rolling) {
-            char tb[24];
-            snprintf(tb, sizeof(tb), "GO %d!", g_dice_total);
-            gfx_draw_ascii(sw / 2 - 42, sh / 2 + 54, tb, 3, 0xFFEA00, 1);
-        }
     } else if (g_state == ST_BUY_LAND) {
         const TileDef *td = &m->tiles[cp->pos];
         const TileState *ts = &g.tiles[cp->pos];
@@ -2555,14 +2788,14 @@ void game_render(void) {
         int pw = 560, ph = 260, px = (sw - pw) / 2, py = (sh - ph) / 2;
         gfx_panel(px, py, pw, ph, 0x162536, 0x4FC3F7, 0x1565C0, 36);
         hal_set_text_bg(0x1565C0);
-        hal_draw_text(px + 16, py + 9, "【大富翁 4 Fun 3D 立體版 操作指南】 (ESC返回)", 0xFFFFFF);
+        hal_draw_text(px + 16, py + 9, "【大富翁 4 Fun 流暢 3D 版 操作指南】 (ESC返回)", 0xFFFFFF);
         hal_set_text_bg(0x162536);
         const char *hl[] = {
+            "• [ESC] 隨時暫停遊戲並開啟暫停選單 (存檔/調AI速度/離開)",
             "• 方向鍵：選單 / 逛 3D 地圖    Enter/空白鍵：擲 3D 骰 / 確認",
             "• [C] 卡片袋  [S] 股市(含走勢圖)  [M] 自由逛 3D 大地圖  [F] 存檔",
-            "• AI 行動時有大字播報卡與左下角戰報，按 [空白鍵] 可跳過或加速",
-            "• 機車=2顆3D骰、汽車=3顆3D骰、加油站依點數收費、研究所免費產卡",
-            "• 路過神明自動附身！踩中地雷或被飛彈擊中會爆炸震動並送醫院！"
+            "• AI 行動中按 [空白鍵] 可切換「一般速度 / 高速模式」或立即跳過報告",
+            "• 機車=2顆3D骰、汽車=3顆3D骰、加油站依點數收費、研究所免費產卡"
         };
         for (int i = 0; i < 5; i++) hal_draw_text(px + 20, py + 52 + i * 36, hl[i], 0xECEFF1);
     } else if (g_state == ST_MESSAGE) {
