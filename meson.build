@@ -1,5 +1,5 @@
 project('richman4-cd952', 'c',
-  version : '1.0.0',
+  version : '3.0.0',
   default_options : ['warning_level=2'])
 
 c = meson.get_compiler('c')
@@ -8,7 +8,7 @@ elf2bestape = find_program('elf2bestape', required: false)
 romtool = find_program('romtool', required: false)
 
 game_elf = executable('richman4-cd952',
-  ['game.c', 'platform_muteki.c'],
+  ['maps.c', 'gfx.c', 'game.c', 'platform_muteki.c'],
   name_suffix: 'elf',
   dependencies: mutekix_lib,
   install : false,

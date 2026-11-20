@@ -1,11 +1,11 @@
 [rom]
-title = "Richman 4 CD952"
-short-title = "Richman4"
+title = "Richman 4 Fun 3D"
+short-title = "Richman3D"
 category = "APPLET_GAME"
 default-locale = "en"
-copyright = "Richman 4 CD952 Homebrew (MIT)"
-version = "1.0.0"
+copyright = "Richman 4 CD952 3D Homebrew v3 (MIT)"
+version = "3.0.0"
 
 [metadata.en]
-title = "Richman 4 CD952"
-short-title = "Richman4"
+title = "Richman 4 Fun 3D"
+short-title = "Richman3D"
