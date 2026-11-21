@@ -6,8 +6,8 @@
 #include "maps.h"
 
 /* 2.5D 斜45度等角3D地塊尺寸 (菱形寬 96px、高 48px、立體厚度 14px) */
-#define ISO_HALF_W 48
-#define ISO_HALF_H 24
+#define ISO_HALF_W 64
+#define ISO_HALF_H 32
 #define ISO_SLAB_H 14
 
 typedef enum {
@@ -59,6 +59,7 @@ void gfx_draw_ascii(int x, int y, const char *str, int scale, uint32_t color, in
 
 /* 精緻 UI 面板 */
 void gfx_panel(int x, int y, int w, int h, uint32_t bg, uint32_t border, uint32_t header_bg, int header_h);
+void gfx_round_btn(int x, int y, int w, int h, int r, uint32_t bg, uint32_t border);
 
 /* 3D 海島世界背景 (低重繪成本，無晃動) */
 void gfx_draw_iso_world_bg(const MapDef *m, int cam_x, int cam_y);

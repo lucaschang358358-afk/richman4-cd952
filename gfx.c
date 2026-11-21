@@ -701,7 +701,7 @@ void gfx_draw_iso_tile(int sx, int sy, const TileDef *td,
                        int toll, int is_cursor, int is_dest, int draw_label) {
     int sw = hal_get_width();
     int sh = hal_get_height();
-    if (sx < -68 || sx > sw + 68 || sy < -78 || sy > sh + 48) return;
+    if (sx < -88 || sx > sw + 88 || sy < -96 || sy > sh + 64) return;
 
     uint32_t top_c = 0xF5EFE0;
     if (td->type == TILE_START || td->type == TILE_BANK) top_c = 0xFFF3CD;
@@ -719,16 +719,16 @@ void gfx_draw_iso_tile(int sx, int sy, const TileDef *td,
     uint32_t right_c = shade_color(side_base, 65);
     uint32_t edge_c  = is_cursor ? 0xFFEA00 : (is_dest ? 0xFF6D00 : 0x37474F);
 
-    gfx_draw_iso_box(sx, sy + ISO_SLAB_H, ISO_HALF_W - 2, ISO_HALF_H - 1, ISO_SLAB_H,
+    gfx_draw_iso_box(sx, sy + ISO_SLAB_H, ISO_HALF_W - 6, ISO_HALF_H - 3, ISO_SLAB_H,
                      top_c, left_c, right_c, edge_c);
 
     if (td->type == TILE_LAND || td->type == TILE_COMMERCIAL) {
         if (owner >= 0) {
-            if (td->type == TILE_COMMERCIAL) draw_3d_comm(sx, sy - 6, comm, owner_color);
-            else draw_3d_house(sx, sy - 6, level, owner_color);
+            if (td->type == TILE_COMMERCIAL) draw_3d_comm(sx, sy - 10, comm, owner_color);
+            else draw_3d_house(sx, sy - 10, level, owner_color);
         }
     } else {
-        draw_3d_landmark(sx, sy - 6, td->type);
+        draw_3d_landmark(sx, sy - 10, td->type);
     }
 
     if (has_roadblock) {
@@ -744,7 +744,7 @@ void gfx_draw_iso_tile(int sx, int sy, const TileDef *td,
 
     if (draw_label && sx > 28 && sx < sw - 54 && sy > 44 && sy < sh - 66) {
         hal_set_text_bg(top_c);
-        hal_draw_text(sx - 26, sy + 2, td->name, 0x1A1A1A);
+        hal_draw_text(sx - 28, sy + 4, td->name, 0x1A1A1A);
         if (td->type == TILE_LAND || td->type == TILE_COMMERCIAL) {
             char pbuf[16];
             int val = (owner < 0) ? td->base_price : toll;
@@ -985,5 +985,29 @@ void gfx_draw_3d_dice(int cx, int cy, int value, int rolling, int bounce_h, int 
         hal_draw_line(px[i3], py[i3], px[i0], py[i0], ecol);
 
         draw_face_pips_3d(cx, draw_cy, f, S, ax, ay, az);
+    }
+}
+
+void gfx_round_btn(int x, int y, int w, int h, int r, uint32_t bg, uint32_t border) {
+    if (w <= 0 || h <= 0) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    /* 柔和陰影 */
+    hal_fill_rect(x + 2, y + 3, w, h - 2, 0x091016);
+    hal_fill_rect(x, y + r, w, h - r * 2, bg);
+    int r2 = r * r;
+    for (int dy = 0; dy < r; dy++) {
+        int cy = r - 1 - dy, dx = 0;
+        while ((dx + 1) * (dx + 1) + cy * cy <= r2) dx++;
+        int inset = r - dx;
+        if (inset < 0) inset = 0;
+        hal_fill_rect(x + inset, y + dy, w - inset * 2, 1, bg);
+        hal_fill_rect(x + inset, y + h - 1 - dy, w - inset * 2, 1, bg);
+    }
+    if (border != 0xFFFFFFFFu) {
+        hal_fill_rect(x + r, y, w - r * 2, 2, border);
+        hal_fill_rect(x + r, y + h - 2, w - r * 2, 2, border);
+        hal_fill_rect(x, y + r, 2, h - r * 2, border);
+        hal_fill_rect(x + w - 2, y + r, 2, h - r * 2, border);
     }
 }

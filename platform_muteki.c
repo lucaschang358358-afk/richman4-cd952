@@ -64,6 +64,7 @@
 #include <muteki/event.h>
 #endif
 
+#include "muteki_touch_adapt.h"
 #include "hal.h"
 #include "game.h"
 
@@ -264,6 +265,59 @@ void hal_draw_text(int x, int y, const char *utf8_text, uint32_t rgb) {
     snprintf(tc->text, sizeof(tc->text), "%s", utf8_text);
 }
 
+
+static inline uint32_t dim75_rgb(uint32_t rgb) {
+    return (((rgb & 0xFEFEFEu) >> 1) + ((rgb & 0xFCFCFCu) >> 2)) & 0xFFFFFFu;
+}
+
+void hal_clear_text_in_rect(int rx, int ry, int rw, int rh) {
+    int out = 0;
+    for (int i = 0; i < g_text_q_len; i++) {
+        TextCmd *tc = &g_text_q[i];
+        int y_ov = (tc->y + 20 > ry) && (tc->y < ry + rh);
+        if (!y_ov || tc->x >= rx + rw) {
+            if (out != i) g_text_q[out] = *tc;
+            out++;
+        }
+    }
+    g_text_q_len = out;
+}
+
+void hal_dim_rect(int rx, int ry, int rw, int rh) {
+    if (!g_backbuf || rw <= 0 || rh <= 0) return;
+    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
+    int x1 = (rx + rw > g_w) ? g_w : (rx + rw);
+    int y1 = (ry + rh > g_h) ? g_h : (ry + rh);
+    if (x0 >= x1 || y0 >= y1) return;
+
+    if (g_is_xrgb) {
+        uint32_t *fb = (uint32_t *)g_backbuf;
+        for (int py = y0; py < y1; py++) {
+            uint32_t *row = fb + py * g_w + x0;
+            for (int n = x1 - x0; n > 0; n--) {
+                uint32_t c = *row;
+                *row++ = ((c & 0xFEFEFEu) >> 1) + ((c & 0xFCFCFCu) >> 2);
+            }
+        }
+    } else {
+        uint16_t *fb = (uint16_t *)g_backbuf;
+        for (int py = y0; py < y1; py++) {
+            uint16_t *row = fb + py * g_w + x0;
+            for (int n = x1 - x0; n > 0; n--) {
+                uint16_t c = *row;
+                uint16_t r = (uint16_t)((((c >> 11) & 31) * 3) >> 2);
+                uint16_t g = (uint16_t)((((c >> 5)  & 63) * 3) >> 2);
+                uint16_t b = (uint16_t)(((c & 31) * 3) >> 2);
+                *row++ = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+        }
+    }
+    for (int i = 0; i < g_text_q_len; i++) {
+        g_text_q[i].fg = dim75_rgb(g_text_q[i].fg);
+        g_text_q[i].bg = dim75_rgb(g_text_q[i].bg);
+    }
+}
+
 static void flush_text_queue(void) {
     if (g_text_q_len <= 0) return;
     SetFontType(MONOSPACE_CJK);
@@ -367,13 +421,24 @@ int main(void) {
     game_render();
 
     ui_event_t uievent = {0};
+    int touch_cd = 0;
     while (g_running) {
+        if (touch_cd > 0) touch_cd--;
         int drained = 0;
-        while (drained < 4 && TestKeyEvent(&uievent) && GetEvent(&uievent)) {
+        while (drained < 4 && (TestKeyEvent(&uievent) || MUTEKI_TEST_TOUCH(&uievent)) && GetEvent(&uievent)) {
             drained++;
             if (uievent.event_type == UI_EVENT_TYPE_KEY) {
                 GameKey k = map_besta_key(uievent.key_code0);
                 if (k != GKEY_NONE) game_on_key(k);
+            } else if (MUTEKI_HAS_TOUCH && MUTEKI_IS_TOUCH_DOWN(uievent)) {
+                if (touch_cd == 0) {
+                    int tx = MUTEKI_TOUCH_X(uievent);
+                    int ty = MUTEKI_TOUCH_Y(uievent);
+                    if (tx >= 0 && ty >= 0 && tx < g_w && ty < g_h) {
+                        game_on_touch(tx, ty);
+                        touch_cd = 4;
+                    }
+                }
             }
             ClearEvent(&uievent);
         }

@@ -51,6 +51,8 @@ void hal_present_rect(int x, int y, int w, int h);
 /* 中文文字佇列 */
 void hal_set_text_bg(uint32_t rgb);
 void hal_draw_text(int x, int y, const char *utf8_text, uint32_t rgb);
+void hal_clear_text_in_rect(int rx, int ry, int rw, int rh);
+void hal_dim_rect(int rx, int ry, int rw, int rh);
 
 void hal_sleep_ms(int ms);
 uint32_t hal_get_seed(void);
